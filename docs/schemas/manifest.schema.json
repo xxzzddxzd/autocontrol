@@ -1,0 +1,250 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "autocontrol 接入清单 v1（autocontrol.json）",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol",
+    "name",
+    "display_name",
+    "workdir",
+    "command",
+    "phases",
+    "schedule",
+    "sections",
+    "tasks"
+  ],
+  "properties": {
+    "protocol": {
+      "const": 1
+    },
+    "name": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_-]{0,31}$"
+    },
+    "display_name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 32
+    },
+    "workdir": {
+      "type": "string",
+      "minLength": 1,
+      "description": "相对清单文件所在目录"
+    },
+    "private": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "lark_config": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "command": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": "占位符：{phase} {service_day} {mode} {python}；必须包含 {phase}"
+    },
+    "phases": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9_]{0,31}$"
+      }
+    },
+    "observe_phase": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]{0,31}$"
+    },
+    "timeouts": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "phase": {
+          "type": "number",
+          "minimum": 10,
+          "maximum": 86400
+        },
+        "observe": {
+          "type": "number",
+          "minimum": 10,
+          "maximum": 86400
+        }
+      }
+    },
+    "schedule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "times"
+      ],
+      "properties": {
+        "timezone": {
+          "type": "string"
+        },
+        "reset": {
+          "type": "string",
+          "pattern": "^([01][0-9]|2[0-3]):[0-5][0-9]$"
+        },
+        "times": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^([01][0-9]|2[0-3]):[0-5][0-9]$"
+          }
+        }
+      }
+    },
+    "account_lock": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "run_scope": {
+      "type": "boolean"
+    },
+    "sections": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "key",
+          "title"
+        ],
+        "properties": {
+          "key": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]{0,31}$"
+          },
+          "title": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 16
+          },
+          "aggregate": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]{0,39}$"
+          }
+        }
+      }
+    },
+    "phase_titles": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 16
+      }
+    },
+    "tasks": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 256,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "title"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]{0,39}$"
+          },
+          "title": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 20
+          },
+          "section": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]{0,31}$"
+          },
+          "kind": {
+            "enum": [
+              "goal",
+              "job",
+              "step"
+            ]
+          },
+          "parent": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]{0,39}$"
+          },
+          "seed": {
+            "type": "boolean"
+          },
+          "demand": {
+            "enum": [
+              "daily",
+              "weekly",
+              "window"
+            ],
+            "description": "需求方：daily 每日、weekly 每周、window 服务器当天开放才有"
+          },
+          "endpoint": {
+            "enum": [
+              "target",
+              "once",
+              "claim"
+            ],
+            "description": "今日终点：target 达到目标、once 完成一次、claim 领完奖励"
+          },
+          "discovery": {
+            "type": "boolean",
+            "description": "「开放活动」发现任务：上报当天开放但无模块处理的活动数"
+          }
+        }
+      }
+    },
+    "reasons": {
+      "type": "object",
+      "propertyNames": {
+        "pattern": "^[a-z][a-z0-9_]{0,47}$"
+      },
+      "additionalProperties": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 40
+      }
+    },
+    "short_reasons": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 8
+      }
+    },
+    "count_keys": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9_]{0,47}$"
+      }
+    },
+    "units": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 4
+      }
+    }
+  }
+}

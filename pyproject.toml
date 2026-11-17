@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autocontrol"
+version = "0.1.0"
+description = "本地自动执行总控台：按计划调度游戏执行器，并用飞书 todolist 卡片实时展示当天进度。"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+autocontrol = "autocontrol.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["autocontrol*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-p no:cacheprovider"
+pythonpath = ["."]
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+skip-string-normalization = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

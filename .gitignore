@@ -1,0 +1,18 @@
+# Python and tool caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+.venv/
+
+# macOS
+.DS_Store
+
+# Runtime state and private data never live in the repo
+# (they belong in each project's private directory, e.g. ~/.config/yslzm).
+*.sqlite3
+lark_app.json
+examples/demo_worker/state.json

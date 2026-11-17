@@ -1,0 +1,31 @@
+{
+  "protocol": 1,
+  "name": "demo",
+  "display_name": "示例脚本",
+  "workdir": ".",
+  "private": "~/.config/autocontrol/demo",
+  "command": ["{python}", "-B", "worker.py", "{phase}"],
+  "phases": ["daily", "shop"],
+  "observe_phase": "status",
+  "timeouts": {"phase": 300, "observe": 60},
+  "schedule": {"timezone": "Asia/Shanghai", "reset": "05:00", "times": ["06:00", "12:00", "20:00"]},
+  "account_lock": null,
+  "run_scope": false,
+  "sections": [
+    {"key": "daily", "title": "日常"},
+    {"key": "shop", "title": "商店"}
+  ],
+  "tasks": [
+    {"id": "signin", "title": "每日签到", "section": "daily"},
+    {"id": "mail", "title": "邮件奖励", "section": "daily"},
+    {"id": "mail_read", "title": "读取邮件", "kind": "step", "parent": "mail"},
+    {"id": "energy", "title": "体力领取", "section": "daily"},
+    {"id": "limited_event", "title": "限时活动", "section": "daily", "demand": "window", "endpoint": "once"},
+    {"id": "open_activities", "title": "开放活动", "section": "daily", "discovery": true},
+    {"id": "weekly_pack", "title": "每周礼包", "section": "shop", "kind": "job"}
+  ],
+  "reasons": {"pack_sold_out": "礼包已售罄"},
+  "short_reasons": {"pack_sold_out": "已售罄"},
+  "count_keys": ["claimed", "unsupported"],
+  "units": []
+}
