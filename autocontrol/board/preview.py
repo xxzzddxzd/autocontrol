@@ -54,18 +54,20 @@ def _element(element: dict) -> str:
         )
     if tag == 'div':
         icon = element.get('icon') or {}
+        token = icon.get('token')
         glyph = {
-            'ellipse_outlined': '',
+            'ellipse_outlined': '',  # drawn as an outlined ring by CSS
             'record_outlined': '●',
             'succeed_filled': '✓',
             'error_filled': '✕',
             'warning-hollow_filled': '!',
-        }.get(icon.get('token'), '•')
+        }.get(token, '•')
+        ring = ' ring' if token == 'ellipse_outlined' else ''
         color = COLORS.get(icon.get('color'), '#646a73')
         text = _inline(element.get('text', {}).get('content', ''))
         return (
-            f'<div class="todo"><span class="mark" style="color:{color};border-color:{color}">{glyph}</span>'
-            f'<span class="text">{text}</span></div>'
+            f'<div class="todo"><span class="mark{ring}" style="color:{color};border-color:{color}">'
+            f'{glyph}</span><span class="text">{text}</span></div>'
         )
     if tag == 'collapsible_panel':
         title = _inline(element.get('header', {}).get('title', {}).get('content', ''))
@@ -113,6 +115,8 @@ def card_html(card: dict, *, title: str = '卡片预览') -> str:
   .todo.done .box {{ background: #3370ff; border-color: #3370ff; }}
   .mark {{ flex: none; width: 14px; height: 14px; margin-top: 3px; font-size: 12px; font-weight: 700;
            line-height: 14px; text-align: center; }}
+  .mark.ring {{ box-sizing: border-box; width: 12px; height: 12px; margin: 4px 1px 0;
+                border: 1.5px solid; border-radius: 50%; }}
   .todo.done .text {{ text-decoration: line-through; opacity: .5; }}
   .md.small {{ font-size: 12px; }}
   .md.indent {{ margin: -4px 0 0 24px; }}
