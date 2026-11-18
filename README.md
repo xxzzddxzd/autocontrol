@@ -2,6 +2,8 @@
 
 本地自动执行总控台：按计划调度各项目的执行器子进程，把每一轮的进度实时写到一张飞书卡片上，归档结果并记录运行指标。Python ≥ 3.10，无第三方依赖。
 
+![卡片示意（示例数据）](docs/card-preview.png)
+
 ## 概念
 
 - **项目**：一个被调度的执行器，两种接入方式：
@@ -65,7 +67,6 @@
 - 测试：`python3 -m pytest`。不联网，不运行真实执行器。
 - 格式：black 和 ruff，行宽 100，见 `pyproject.toml`。
 - 内置适配器的结果解析是从上游执行器移植的副本（见各模块文档字符串），上游结果格式变化时需要同步。
-- 卡片样式示意（示例数据）：[docs/card-preview.png](docs/card-preview.png)。
 
 ```
 autocontrol/   schedule、runner、service、protocol、admission、metrics；board/ 卡片；lark/ 飞书；projects/ 项目接入
