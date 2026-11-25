@@ -44,6 +44,14 @@ class Runner:
     def phases_for(self, now, *, scheduled_at=None):
         return ('due-at', scheduled_at)
 
+    def start_day(self, now):
+        self.calls.append(('day', now))
+        return True
+
+    def resume(self, now):
+        self.calls.append(('resume', now))
+        return True
+
     def run_once(self, *, observe_only, now, phases=None):
         self.calls.append((observe_only, now))
         self.phases.append(phases)
@@ -53,11 +61,11 @@ class Runner:
         return result
 
 
-def serve(results, *, start, limit, observe_first=False):
+def serve(results, *, start, limit, observe_first=False, **options):
     clock = Clock(start)
     runner = Runner(results)
     stop = Stop(clock, runner, limit)
-    run_service(runner, stop=stop, clock=clock, observe_first=observe_first)
+    run_service(runner, stop=stop, clock=clock, observe_first=observe_first, **options)
     return runner, stop
 
 
@@ -98,7 +106,83 @@ def test_runner_errors_and_failed_discovery_back_off_exponentially():
     assert backoff(10) == 900.0
 
 
-def test_day_reset_wakes_for_read_only_discovery():
+def test_day_reset_wakes_for_read_only_discovery_when_no_round_follows_soon():
     start = datetime(2026, 11, 17, 4, 40, tzinfo=BEIJING)
-    runner, _ = serve([{'status': 'finished', 'code': 0}], start=start, limit=2)
+    runner, _ = serve([{'status': 'finished', 'code': 0}], start=start, limit=2, reset_skip=0)
     assert runner.calls[1] == (True, start.replace(hour=5, minute=0))
+
+
+def test_a_reset_followed_soon_by_a_round_draws_the_new_day_without_a_login():
+    start = datetime(2026, 11, 17, 4, 40, tzinfo=BEIJING)
+    reset = start.replace(hour=5, minute=0)
+    first = SCHEDULE.next_check(reset)
+    assert (first - reset).total_seconds() <= 5400
+    lines = []
+    runner, _ = serve([], start=start, limit=3, log=lines.append)
+    assert runner.calls == [(False, start), ('day', reset), (False, first)]
+    assert f'换日：{first:%H:%M} 就有一轮，不登录，按清单出新一天的卡片' in lines
+
+
+def test_resuming_after_new_console_code_waits_for_the_next_wake_without_a_login():
+    start = datetime(2026, 11, 17, 10, 0, tzinfo=BEIJING)
+    lines = []
+    runner, _ = serve([], start=start, limit=2, resume=True, log=lines.append)
+    assert runner.calls == [('resume', start), (False, start.replace(hour=13, minute=15))]
+    assert lines[0] == '沿用已保存的卡片，不登录，等下一轮'
+    assert '下一轮 13:15（固定时刻 13:15）' in lines
+
+
+def test_the_log_says_why_each_round_runs_and_how_it_ended():
+    start = datetime(2026, 11, 17, 10, 0, tzinfo=BEIJING)
+    lines = []
+    results = [{'status': 'finished', 'code': 0, 'phases': 2, 'delivery': {'status': 'sent'}}]
+    serve(results, start=start, limit=1, log=lines.append)
+    assert lines[0].startswith('开始一轮：启动补跑')
+    assert lines[1] == '一轮结束：状态 finished，退出码 0，2 个阶段，卡片 sent，用时 0 秒'
+    assert lines[2] == '下一轮 13:15（固定时刻 13:15）'
+
+
+class LateRunner(Runner):
+    """Each round takes ``minutes``; ``late`` lists, per round, the server
+    times its phases reported that passed during it."""
+
+    def __init__(self, clock, late, minutes):
+        super().__init__([])
+        self.clock, self.late, self.minutes, self.overdue = clock, list(late), minutes, ()
+
+    def run_once(self, *, observe_only, now, phases=None):
+        result = super().run_once(observe_only=observe_only, now=now, phases=phases)
+        self.clock.now += timedelta(minutes=self.minutes)
+        self.overdue = tuple(self.late.pop(0)) if self.late else ()
+        return result
+
+    def take_overdue(self):
+        found, self.overdue = self.overdue, ()
+        return found
+
+
+def serve_late(late, *, start, limit, minutes=5):
+    clock = Clock(start)
+    runner = LateRunner(clock, late, minutes)
+    run_service(runner, stop=Stop(clock, runner, limit), clock=clock)
+    return runner
+
+
+def test_a_server_time_that_passed_during_the_round_runs_right_after_it_once():
+    start = datetime(2026, 11, 17, 10, 0, tzinfo=BEIJING)
+    first, second = start + timedelta(minutes=3), start + timedelta(minutes=8)
+    runner = serve_late([(first.timestamp(),), (second.timestamp(),)], start=start, limit=3)
+    fixed = start.replace(hour=13, minute=15)
+    # The 10:03 time passed while the round ran: it runs at 10:05 with that
+    # time as its wake. The catch-up round's own passed time starts nothing.
+    assert [call[1] for call in runner.calls] == [start, start + timedelta(minutes=5), fixed]
+    assert runner.phases[1] == ('due-at', first)
+    assert runner.phases[2] == ('due-at', fixed)
+
+
+def test_a_passed_server_time_is_left_to_a_round_that_is_due_soon_anyway():
+    start = datetime(2026, 11, 17, 13, 9, tzinfo=BEIJING)
+    runner = serve_late([((start + timedelta(minutes=2)).timestamp(),)], start=start, limit=2)
+    # The round ends 13:14 and the 13:15 round is due within two minutes: it runs instead.
+    assert [call[1] for call in runner.calls] == [start, start.replace(minute=15)]
+    assert runner.phases[1] == ('due-at', start.replace(minute=15))

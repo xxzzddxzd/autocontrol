@@ -9,6 +9,10 @@ failure only the newest snapshot of each day is retried, with backoff.
 Card identity is made idempotent with a stable per-day UUID: an uncertain
 create is resolved from chat history or the same UUID inside the server's
 one-hour idempotency window, never by sending a second card.
+
+The console-wide switch ``cards.json`` (``{"lark": false}``) turns Lark cards
+off: each snapshot is then only saved locally for the web board, and no Feishu
+API is called. Turning it back on brings every remembered day to its card.
 """
 
 from __future__ import annotations
@@ -26,11 +30,49 @@ import threading
 import time
 import uuid
 
+from . import assets
 from .client import DeliveryError, FeishuClient, load_config
 from .store import BoardStore
 
 UUID_WINDOW_SECONDS = 3500
-SUCCESS = frozenset({'sent', 'unchanged', 'stale_ignored'})
+SUCCESS = frozenset({'sent', 'unchanged', 'stale_ignored', 'local'})
+CARDS_FILE = 'cards.json'
+
+
+def cards_switch_path(console_dir=None) -> Path:
+    """The console-wide card switch, next to the project list."""
+    if console_dir is None:
+        from .. import registry
+
+        console_dir = registry.default_path().parent
+    return Path(console_dir) / CARDS_FILE
+
+
+def _switch_off(path) -> bool:
+    try:
+        with open(path, 'rb') as source:
+            data = json.loads(source.read(4096))
+    except (OSError, ValueError):
+        return False
+    return isinstance(data, dict) and data.get('lark') is False
+
+
+def cards_off(console_dir=None) -> bool:
+    """True when Lark cards are switched off and snapshots only feed the web board."""
+    return _switch_off(cards_switch_path(console_dir))
+
+
+def set_cards(on: bool, console_dir=None) -> Path:
+    """Switch Lark cards on or off for every project; schedulers notice within seconds."""
+    path = cards_switch_path(console_dir)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    temporary = path.with_name(f'.{path.name}.tmp')
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'w', encoding='utf-8') as output:
+        json.dump({'lark': bool(on)}, output)
+        output.write('\n')
+    os.replace(temporary, path)
+    return path
 
 
 def _observed_at(snapshot):
@@ -90,8 +132,11 @@ class CardPublisher:
         max_days=32,
         client_factory=FeishuClient,
         uuid_namespace='yslzm-daily-board',
+        switch_path=None,
     ):
         self.private = Path(private).expanduser()
+        # None: no console-wide switch (cards always go to Lark).
+        self.switch_path = Path(switch_path).expanduser() if switch_path else None
         self.render = render
         self.sanitize = sanitize
         self.config_path = (
@@ -116,6 +161,8 @@ class CardPublisher:
         self._busy = False
         self._stopping = False
         self._backend = None  # (config signature, store, client, chat_id)
+        self._icons = None  # uploaded card images for the current bot
+        self._icons_retry_at = 0.0
         self._status = {'status': 'initializing', 'error_code': None, 'api_code': None}
         self._thread = threading.Thread(target=self._work, name='autocontrol-card', daemon=True)
         self._thread.start()
@@ -257,12 +304,24 @@ class CardPublisher:
                         self._retry_at = time.monotonic() + min(backoff, self.max_retry_interval)
                     self._cond.notify_all()
 
-    def _config_signature(self):
+    @staticmethod
+    def _file_signature(path):
+        if path is None:
+            return None
         try:
-            info = self.config_path.stat()
+            info = path.stat()
             return info.st_mtime_ns, info.st_size, info.st_ino
         except OSError:
             return None
+
+    def _config_signature(self):
+        config = self._file_signature(self.config_path)
+        if self.switch_path is None:
+            return config
+        return config, self._file_signature(self.switch_path)
+
+    def _local_only(self) -> bool:
+        return self.switch_path is not None and _switch_off(self.switch_path)
 
     def _ensure_backend(self):
         signature = self._config_signature()
@@ -270,12 +329,27 @@ class CardPublisher:
         if backend is not None and backend[0] == signature:
             return backend[1:]
         self._backend = None
+        if self._local_only():
+            # Cards are off: keep each snapshot for the web board under the
+            # usual chat key (so turning cards back on finds the same card).
+            try:
+                chat_id = load_config(self.config_path).get('chat_id') or 'local'
+            except DeliveryError:
+                chat_id = 'local'
+            store = BoardStore(self.db_path, sanitize=self.sanitize)
+            self._backend = (signature, store, None, chat_id)
+            if backend is not None:
+                with self._cond:
+                    for key, value in self._latest.items():
+                        self._pending.setdefault(key, value)
+            return self._backend[1:]
         config = load_config(self.config_path)
         if not config.get('chat_id'):
             raise DeliveryError('chat_id_missing')
         store = BoardStore(self.db_path, sanitize=self.sanitize)
         client = self.client_factory(config)
         self._backend = (signature, store, client, config['chat_id'])
+        self._icons = None  # a new bot needs its own uploads
         if backend is not None:
             # A new chat or app: bring every remembered day to the new target.
             with self._cond:
@@ -299,10 +373,37 @@ class CardPublisher:
             self._set_status('failed', 'storage_error')
             return False
 
-    def _publish(self, store, client, chat_id, snapshot) -> bool:
-        project, day = snapshot['project'], snapshot['service_day']
+    def _card_icons(self, client) -> dict:
+        """Uploaded images for the card; an upload failure falls back to static icons."""
+        now = time.monotonic()
+        if self._icons is not None and (self._icons or now < self._icons_retry_at):
+            return self._icons
         try:
-            card = self.render(snapshot)
+            self._icons = {'spinner': assets.spinner_key(self.private, client)}
+        except Exception:
+            self._icons, self._icons_retry_at = {}, now + 3600.0
+        return self._icons
+
+    def _keep_local(self, store, chat_id, snapshot) -> bool:
+        """Cards are off: save the newest display for the web board, call nothing."""
+        project, day = snapshot['project'], snapshot['service_day']
+        row = store.get(project, day, chat_id) or {}
+        if is_older(snapshot, row.get('snapshot')):
+            self._set_status('stale_ignored')
+            return True
+        store.save(
+            project, day, chat_id, snapshot=snapshot, delivery_status='local', error_code=None
+        )
+        self._set_status('local')
+        return True
+
+    def _publish(self, store, client, chat_id, snapshot) -> bool:
+        if client is None:
+            return self._keep_local(store, chat_id, snapshot)
+        project, day = snapshot['project'], snapshot['service_day']
+        icons = self._card_icons(client)
+        try:
+            card = self.render(snapshot, icons=icons) if icons else self.render(snapshot)
             canonical = json.dumps(card, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
             digest = hashlib.sha256(canonical.encode('utf-8')).hexdigest()
         except Exception:

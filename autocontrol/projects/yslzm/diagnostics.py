@@ -297,9 +297,109 @@ PROOF_PARTS = frozenset(
         'quota_advance',
     )
 )
+RESOURCE_KINDS = frozenset(('points', 'diamonds', 'gold', 'fashion', 'dye', 'item', 'reputation'))
+SHOP_PROOF_COMMANDS = frozenset(
+    (29, 32, 39, 40, 41, 42, 43, 45, 46, 59, 60, 145, 338, 341, 342, 561, 577, 610, 754, 755)
+)
+FIRST_CLEAR_PROOF_COMMANDS = frozenset((29, 89, 561, 642, 643, 703, 704, 705, 725, 746, 747, 748))
+FIRST_CLEAR_RESPONSE_COMMANDS = frozenset((703, 704, 747))
+
+
+def _rows(value):
+    return value if type(value) in (list, tuple) else ()
+
+
+def _bounded(value, low, high):
+    return type(value) is int and low <= value <= high
+
+
+def _proof_facts(source):
+    """Flat numbers from the native diagnostics of a failed shop purchase or
+    first clear. Until 2026-11-22 both were dropped here, so a resource delta
+    mismatch or a 12 s step deadline could not be told apart. The values are
+    validated below like any saved row; nothing else of the dict is kept."""
+    facts = source.get('diagnostics')
+    kind = source.get('kind')
+    if type(facts) is not dict or kind not in ('shop_purchase', 'stage_first_clear'):
+        return {}
+    result = {}
+    if kind == 'shop_purchase':
+        # (resource kind, counter, expected change, observed change or None, before)
+        result['resource_deltas'] = [
+            (
+                row.get('kind'),
+                row.get('counter'),
+                row.get('expected_delta'),
+                row.get('delta'),
+                row.get('before'),
+            )
+            for row in _rows(facts.get('resources'))
+            if type(row) is dict
+        ]
+        if facts.get('quota_before') is not None:
+            result['quota_counts'] = (
+                facts.get('quota_before'),
+                facts.get('quota_expected'),
+                facts.get('quota_after'),
+            )
+        receipt = facts.get('shopping_result')
+        if type(receipt) is dict:
+            result['receipt_codes'] = (
+                receipt.get('code'),
+                *(
+                    row.get('code') if type(row) is dict else None
+                    for row in _rows(receipt.get('cart_results'))
+                ),
+            )
+        commands = [
+            (row.get('command'), row.get('count'))
+            for row in _rows(facts.get('commands'))
+            if type(row) is dict
+        ]
+        preferred = SHOP_PROOF_COMMANDS
+        errors = facts.get('errors')
+    else:
+        result['stage_id'] = facts.get('stage_id')
+        result['sent_commands'] = facts.get('sent_commands')
+        counts = facts.get('all_received_command_counts')
+        commands = (
+            [
+                (int(key), value)
+                for key, value in counts.items()
+                if type(key) is str and key.isascii() and key.isdigit()
+            ]
+            if type(counts) is dict
+            else []
+        )
+        preferred = FIRST_CLEAR_PROOF_COMMANDS
+        errors = facts.get('native_errors')
+        result['response_codes'] = (
+            [(703, code) for code in _rows(facts.get('entry_error_codes'))]
+            + [(704, code) for code in _rows(facts.get('legacy_start_error_codes'))]
+            + [
+                (747, row.get('error_code'))
+                for row in _rows(facts.get('combat_start_observations'))
+                if type(row) is dict
+            ]
+        )
+    valid = [
+        (command, count)
+        for command, count in commands
+        if _bounded(command, 1, 65535) and _bounded(count, 1, 100000)
+    ]
+    result['observed_commands'] = sorted(
+        sorted(valid, key=lambda row: (row[0] not in preferred, row[1], row[0]))[:16]
+    )
+    result['native_errors'] = [
+        (row.get('kind'), row.get('show'), row.get('code'))
+        for row in _rows(errors)
+        if type(row) is dict
+    ]
+    return result
 
 
 def public_issue_target(source):
+    source = {**_proof_facts(source), **source}
     result = {}
     for key in ('sku', 'item', 'limit', 'target_id', 'npc_id', 'reputation_id'):
         value = source.get(key)
@@ -319,7 +419,118 @@ def public_issue_target(source):
         values = tuple(sorted({v for v in missing[:8] if type(v) is str and v in PROOF_PARTS}))
         if values:
             result['missing_proof'] = values
+    # A failed craft debit proof: (kind, material template, expected change,
+    # observed change or None) and (command, count) pairs. Numbers only. A
+    # one-copy wardrobe material is expected to change by 0.
+    deltas = source.get('material_deltas')
+    if type(deltas) in (list, tuple):
+        rows = tuple(tuple(row) for row in deltas[:4] if _material_delta(row))
+        if rows:
+            result['material_deltas'] = rows
+    commands = source.get('observed_commands')
+    if type(commands) in (list, tuple):
+        pairs = tuple(tuple(row) for row in commands[:16] if _command_count(row))
+        if pairs:
+            result['observed_commands'] = pairs
+    # A failed shop proof: (resource kind, counter, expected change, observed
+    # change or None, before or None), quota (before, expected, after or None)
+    # and the receipt's overall then per-cart codes.
+    resources = source.get('resource_deltas')
+    if type(resources) in (list, tuple):
+        rows = tuple(tuple(row) for row in resources[:8] if _resource_delta(row))
+        if rows:
+            result['resource_deltas'] = rows
+    quota = source.get('quota_counts')
+    if (
+        type(quota) in (list, tuple)
+        and len(quota) == 3
+        and _bounded(quota[0], 0, 65535)
+        and all(value is None or _bounded(value, 0, 65535) for value in quota[1:])
+    ):
+        result['quota_counts'] = tuple(quota)
+    codes = source.get('receipt_codes')
+    if (
+        type(codes) in (list, tuple)
+        and 1 <= len(codes) <= 9
+        and all(_bounded(code, -1, 2**31 - 1) for code in codes)
+    ):
+        result['receipt_codes'] = tuple(codes)
+    # A failed first clear: the stage, the commands it sent (the last one is
+    # the step that got no reply), and the entry/start/combat reply codes.
+    stage = source.get('stage_id')
+    if _bounded(stage, 1, 2**31 - 1):
+        result['stage_id'] = stage
+    sent = source.get('sent_commands')
+    if type(sent) in (list, tuple):
+        values = tuple(command for command in sent[-16:] if _bounded(command, 1, 65535))
+        if values:
+            result['sent_commands'] = values
+    replies = source.get('response_codes')
+    if type(replies) in (list, tuple):
+        rows = tuple(
+            tuple(row)
+            for row in replies[:8]
+            if type(row) in (list, tuple)
+            and len(row) == 2
+            and type(row[0]) is int
+            and row[0] in FIRST_CLEAR_RESPONSE_COMMANDS
+            and _bounded(row[1], -1, 2**31 - 1)
+        )
+        if rows:
+            result['response_codes'] = rows
+    # Native command 29 errors of either: (kind, show, code).
+    errors = source.get('native_errors')
+    if type(errors) in (list, tuple):
+        rows = tuple(
+            tuple(row)
+            for row in errors[:4]
+            if type(row) in (list, tuple)
+            and len(row) == 3
+            and _bounded(row[0], 0, 255)
+            and _bounded(row[1], 0, 255)
+            and _bounded(row[2], 0, 65535)
+        )
+        if rows:
+            result['native_errors'] = rows
     return result
+
+
+def _material_delta(row):
+    return (
+        type(row) in (list, tuple)
+        and len(row) == 4
+        and type(row[0]) is int
+        and row[0] in (0, 1)
+        and type(row[1]) is int
+        and 0 < row[1] <= 2**31 - 1
+        and type(row[2]) is int
+        and -100000 <= row[2] <= 0
+        and (row[3] is None or type(row[3]) is int and -100000 <= row[3] <= 100000)
+    )
+
+
+def _resource_delta(row):
+    return (
+        type(row) in (list, tuple)
+        and len(row) == 5
+        and type(row[0]) is str
+        and row[0] in RESOURCE_KINDS
+        and _bounded(row[1], 0, 2**31 - 1)
+        and _bounded(row[2], -(10**9), 10**9)
+        and (row[3] is None or _bounded(row[3], -(10**9), 10**9))
+        and (row[4] is None or _bounded(row[4], 0, 2**53))
+    )
+
+
+def _command_count(row):
+    return (
+        type(row) in (list, tuple)
+        and len(row) == 2
+        and type(row[0]) is int
+        and 0 < row[0] <= 65535
+        and type(row[1]) is int
+        and 0 < row[1] <= 100000
+    )
 
 
 TASKS = {14804: 'official_shop_coin', 2109: 'heart_crafting_coin'}

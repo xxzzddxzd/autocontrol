@@ -71,17 +71,20 @@ JOBS = (
     TaskSpec('main_story_crafting', '主线制作', 'craft', 'job', seed=True),
     TaskSpec('palette_unlock', '普通色盘', 'wardrobe', 'job'),
     TaskSpec('qianhuan', '千幻色盘', 'wardrobe', 'job'),
-    TaskSpec('activity_resources', '活动资源', 'activities', 'job'),
-    TaskSpec('astrology', '占星物语', 'activities', 'job'),
-    TaskSpec('bear', '寻找贪吃熊', 'activities', 'job'),
+    # Limited-time activities exist only while the server opens them today
+    # (demand 'window'): closed is hidden, a window that closes undone shows
+    # as missed. 活动资源 grants the water and rings those activities use.
+    TaskSpec('activity_resources', '活动资源', 'activities', 'job', demand='window'),
+    TaskSpec('astrology', '占星物语', 'activities', 'job', demand='window'),
+    TaskSpec('bear', '寻找贪吃熊', 'activities', 'job', demand='window'),
     TaskSpec('produce_activity', '免活复刻', 'activities', 'job'),
     TaskSpec('produce_common', '复刻通用物品', 'activities', 'job'),
-    TaskSpec('ring_toss', '套圈', 'activities', 'job'),
+    TaskSpec('ring_toss', '套圈', 'activities', 'job', demand='window'),
     TaskSpec('activity_rewards', '活动奖励', 'activities', 'job'),
-    TaskSpec('penglai', '画中蓬莱', 'activities', 'job'),
+    TaskSpec('penglai', '画中蓬莱', 'activities', 'job', demand='window'),
     TaskSpec('brand_atlas', '品牌图鉴', 'activities', 'job'),
     TaskSpec('brand_tower', '品牌挑战', 'activities', 'job'),
-    TaskSpec('activity_discovery', '开放活动', 'activities', 'job'),
+    TaskSpec('activity_discovery', '开放活动', 'activities', 'job', discovery=True),
 )
 
 # Sub-steps never prove their parent goal complete.

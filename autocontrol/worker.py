@@ -3,7 +3,8 @@
 Progress arrives as JSON lines on an inherited pipe whose descriptor number is
 passed in an environment variable. Events are parsed in memory and handed to a
 callback; stdout is kept in a bounded buffer (the last line is the worker's
-summary) and stderr is discarded. Nothing is spooled to disk, and a failing
+summary). stderr is discarded unless the caller asks for its bounded tail
+(``on_stderr``), which it may keep for people to diagnose a failure. A failing
 callback can never abort the worker.
 """
 
@@ -17,6 +18,23 @@ import time
 
 MAX_EVENT = 64 * 1024
 MAX_OUTPUT = 2 * 1024 * 1024 + 1
+MAX_STDERR = 16 * 1024
+
+
+def _keep_tail(tail: bytearray, chunk: bytes) -> None:
+    tail.extend(chunk)
+    if len(tail) > MAX_STDERR:
+        del tail[:-MAX_STDERR]
+
+
+def _drain(fd: int, tail: bytearray) -> None:
+    """Read what a pipe already holds without waiting for its writer to close it."""
+    os.set_blocking(fd, False)
+    try:
+        while chunk := os.read(fd, 65536):
+            _keep_tail(tail, chunk)
+    except BlockingIOError:
+        pass
 
 
 def _stop(child: subprocess.Popen) -> None:
@@ -41,6 +59,7 @@ def run_streamed(
     raw=False,
     on_line=None,
     restart_timeout_on_line=False,
+    on_stderr=None,
 ):
     """Run ``argv``; return ``CompletedProcess`` whose stdout is the bounded tail.
 
@@ -48,12 +67,15 @@ def run_streamed(
     for a line over :data:`MAX_EVENT`) so a caller can validate and count it.
     ``on_line`` receives every complete stdout line as bytes while the child
     runs; with ``restart_timeout_on_line`` each such line restarts ``timeout``
-    (a multi-phase worker prints one line per finished phase).
+    (a multi-phase worker prints one line per finished phase). ``on_stderr``
+    receives the last :data:`MAX_STDERR` bytes the child wrote to stderr once
+    it has ended, also after a timeout, and only when there were any.
     """
     read_fd, write_fd = os.pipe()
     env = {**os.environ, 'PYTHONDONTWRITEBYTECODE': '1', **(env or {}), progress_env: str(write_fd)}
     child = None
     output = bytearray()
+    errors = bytearray() if on_stderr is not None else None
     pending = bytearray()
     dropping = False
     clock = {'deadline': time.monotonic() + timeout if timeout is not None else None}
@@ -89,13 +111,15 @@ def run_streamed(
             pass_fds=(write_fd,),
             stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE if errors is not None else subprocess.DEVNULL,
         )
         os.close(write_fd)
         write_fd = None
         with selectors.DefaultSelector() as selector:
             selector.register(read_fd, selectors.EVENT_READ, 'event')
             selector.register(child.stdout, selectors.EVENT_READ, 'stdout')
+            if errors is not None:
+                selector.register(child.stderr, selectors.EVENT_READ, 'stderr')
             remaining_input = memoryview(input) if input is not None else None
             if remaining_input is not None:
                 os.set_blocking(child.stdin.fileno(), False)
@@ -106,6 +130,15 @@ def run_streamed(
             while selector.get_map():
                 if expired():
                     give_up()
+                if (
+                    errors is not None
+                    and {key.data for key in selector.get_map().values()} == {'stderr'}
+                    and child.poll() is not None
+                ):
+                    # The worker is gone; a helper it left behind may hold its
+                    # stderr open. Keep what is already written, never wait.
+                    _drain(child.stderr.fileno(), errors)
+                    break
                 for key, _ in selector.select(0.25):
                     if key.data == 'stdin':
                         try:
@@ -120,6 +153,9 @@ def run_streamed(
                     chunk = os.read(key.fd, 65536)
                     if not chunk:
                         selector.unregister(key.fileobj)
+                        continue
+                    if key.data == 'stderr':
+                        _keep_tail(errors, chunk)
                         continue
                     if key.data == 'stdout':
                         output.extend(chunk)
@@ -165,8 +201,15 @@ def run_streamed(
             _stop(child)
             if child.stdout is not None:
                 child.stdout.close()
+            if child.stderr is not None:
+                child.stderr.close()
             if child.stdin is not None and not child.stdin.closed:
                 child.stdin.close()
+        if errors:
+            try:
+                on_stderr(bytes(errors))
+            except Exception:
+                pass  # diagnostics never affect the phase
 
 
 def last_json_line(output, limit: int = 2 * 1024 * 1024):

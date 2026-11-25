@@ -16,6 +16,7 @@ from pathlib import Path
 import shutil
 
 from . import protocol
+from .locks import is_free
 from .projects.manifest import ManifestError, ManifestProject, load_manifest
 
 CRITERIA = {
@@ -27,6 +28,7 @@ CRITERIA = {
     'M6': ('must', '计划覆盖清单中的全部固定任务'),
     'M7': ('must', '只读模式未发出变更请求（metrics.actions_sent = 0）'),
     'M8': ('must', '等待开放的窗口型任务带开放时刻，且该时刻在 next_wake 中'),
+    'M9': ('must', '声明的账号锁可以探测'),
     'S1': ('should', '未输出协议外字段'),
     'S2': ('should', '只读发现耗时不超过超时上限的一半'),
     'S3': ('should', '上报操作指标（actions_sent、reads 等）'),
@@ -38,6 +40,21 @@ CRITERIA = {
 def _item(ident, passed, detail=''):
     level, title = CRITERIA[ident]
     return {'id': ident, 'level': level, 'title': title, 'passed': passed, 'detail': detail}
+
+
+LOCK_BUSY = '当前被占用'
+
+
+def _probe_account_lock(project) -> tuple[bool, str]:
+    """Whether the declared account lock can be probed, and what the probe saw."""
+    account = project.account_lock
+    if account is None:
+        return True, '未声明'
+    try:
+        return True, '' if is_free(account) else LOCK_BUSY
+    except (OSError, ValueError) as error:
+        why = str(error) if isinstance(error, ValueError) else type(error).__name__
+        return False, f'无法探测：{why}'
 
 
 def _command_available(project) -> tuple[bool, str]:
@@ -123,9 +140,11 @@ def run_check(manifest, *, workdir=None, private=None, live=True, repeat=1, save
     criteria.append(_item('M1', True))
     available, why = _command_available(project)
     criteria.append(_item('M2', available, why))
+    lock_item = _item('M9', *_probe_account_lock(project))
     if not live or not available:
         for ident in ('M3', 'M4', 'M5', 'M6', 'M7', 'M8'):
             criteria.append(_item(ident, False, '未执行只读发现' if not live else '启动命令不可用'))
+        criteria.append(lock_item)
         report['passed'] = False
         return report
 
@@ -170,6 +189,7 @@ def run_check(manifest, *, workdir=None, private=None, live=True, repeat=1, save
                           '' if sent == 0 else f'只读模式发出了 {sent} 个变更请求'))  # fmt: skip
     window_m8, window_s5 = _window_checks(project, record, details)
     criteria.append(window_m8)
+    criteria.append(lock_item)
     ignored = details['report'].ignored + details['result_report'].ignored
     criteria.append(_item('S1', not ignored, '；'.join(ignored[:8])))
     duration = record.get('duration_ms') or 0
@@ -221,11 +241,10 @@ def run_adapter_check(project, *, live=True, save=True) -> dict:
             ):
                 seen['unmapped'].add(str(status)[:40])
 
-        from .locks import is_free
-
-        account = project.account_lock
-        if account is not None and not is_free(account):
-            criteria.append(_adapter_item('L1', '只读发现正常结束', False, '账号正被其他程序使用，请稍后重试'))
+        probed, seen_lock = _probe_account_lock(project)
+        if not probed or seen_lock == LOCK_BUSY:
+            criteria.append(_adapter_item('L1', '只读发现正常结束', False,
+                                          '账号正被其他程序使用，请稍后重试' if probed else seen_lock))  # fmt: skip
         else:
             import time as _time
 
@@ -257,12 +276,31 @@ def _adapter_item(ident, title, passed, detail='', level='must'):
 
 
 def record_path(project) -> Path:
-    return project.private / 'admission' / f'{project.name}.json'
+    return record_file(project.private, project.name)
+
+
+def record_file(private, name) -> Path:
+    return Path(private) / 'admission' / f'{name}.json'
+
+
+def passed_digest(private, name) -> str | None:
+    """The manifest digest of the project's last admission record, when it passed."""
+    try:
+        record = json.loads(record_file(private, name).read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return None
+    if type(record) is not dict or record.get('passed') is not True:
+        return None
+    return record['digest'] if type(record.get('digest')) is str else None
 
 
 def save_record(project, report) -> Path:
     path = record_path(project)
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # serve refuses a private directory that is not 0700, and mkdir(parents=True)
+    # would create it with the umask's mode, so create it explicitly first.
+    project.private.parent.mkdir(parents=True, exist_ok=True)
+    project.private.mkdir(mode=0o700, exist_ok=True)
+    path.parent.mkdir(exist_ok=True, mode=0o700)
     os.chmod(path.parent, 0o700)
     temporary = path.with_name('.' + path.name + '.tmp')
     fd = os.open(

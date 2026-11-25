@@ -9,7 +9,12 @@ reasons never reach the board.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import re
 from typing import Callable, Iterable, Mapping
+
+# Error codes share the protocol's nonnegative current field; the unit keeps
+# the sign explicit without changing the protocol for ordinary progress.
+ERROR_CODE_UNITS = frozenset(('错误码', '负错误码'))
 
 # Display states, in no particular order.
 STATUSES = (
@@ -50,8 +55,10 @@ BOARD_REASONS = {
 # Short labels the board itself uses on a task line.
 BOARD_SHORT_REASONS = {'window_ended': '已错过'}
 # What creates the work, and what finishes today's part (manifest task fields).
-DEMANDS = ('daily', 'weekly', 'window')
+DEMANDS = ('daily', 'weekly', 'window', 'round')
 ENDPOINTS = ('target', 'once', 'claim')
+# A {count_key} field in a task's finished-row text (manifest ``done_text``).
+DONE_FIELD = re.compile(r'\{([a-z][a-z0-9_]{0,47})\}')
 DEFAULT_REASON = {
     'failed': 'failure',
     'result_unavailable': 'state_unavailable',
@@ -78,10 +85,18 @@ class TaskSpec:
     progress: tuple[tuple[str, str], ...] = ()
     unit: str | None = None
     next_run_count: str | None = None
-    # 需求方: 'window' work exists only while the server opens it today.
+    # 需求方: 'window' work exists only while the server opens it today;
+    # 'round' work regenerates between rounds (收菜, see Catalog.round_tasks).
     demand: str | None = None
     endpoint: str | None = None  # 今日终点: 'target', 'once' or 'claim'
     discovery: bool = False  # counts open activities no module handles
+    # Text after a finished row's time; its {count_key} fields come from the row's counts.
+    done_text: str | None = None
+    # The same for an unfinished row: shown instead of its progress and short reason.
+    progress_text: str | None = None
+    # The phase that runs it when that is not its section's phase (e.g. listed
+    # under 日常 but run by a phase with its own times).
+    phase: str | None = None
 
 
 @dataclass(frozen=True)
@@ -95,6 +110,24 @@ class Section:
     key: str
     title: str
     aggregate: str | None = None
+
+
+def idle_phases(catalog, schedule, rows) -> frozenset:
+    """Slotted phases on their idle times: a task of the phase's section last
+    reported ``blocked`` with the reason the schedule names for it."""
+    reasons = schedule.idle_reasons
+    found = set()
+    for row in rows if reasons and type(rows) in (list, tuple) else ():
+        key = row.get('task_id') if type(row) is dict else None
+        spec = catalog.tasks.get(key) if type(key) is str else None
+        if spec is None or row.get('status') != 'blocked':
+            continue
+        for phase, reason in reasons.items():
+            if row.get('reason') == reason and spec.section == catalog.phase_sections.get(
+                phase, phase
+            ):
+                found.add(phase)
+    return frozenset(found)
 
 
 class Catalog:
@@ -214,6 +247,11 @@ class Catalog:
             if type(value) is str and value in self.reasons:
                 return value
         return DEFAULT_REASON.get(state)
+
+    def run_section(self, key: str) -> str:
+        """The section of the phase that runs a task (its own section unless ``phase``)."""
+        spec = self.tasks[key]
+        return self.phase_sections.get(spec.phase, spec.phase) if spec.phase else spec.section
 
     def section_tasks(self, section: str) -> list[str]:
         return [key for key, spec in self.tasks.items() if spec.section == section]

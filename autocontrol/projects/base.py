@@ -12,6 +12,7 @@ Two kinds exist (see ``docs/接入规范.md``):
 
 from __future__ import annotations
 
+from datetime import date, timedelta
 from functools import partial
 import json
 from pathlib import Path
@@ -91,8 +92,16 @@ class Project:
 
     # -- board ---------------------------------------------------------------
 
-    def render(self, snapshot) -> dict:
-        return self.renderer.render(snapshot)
+    def render(self, snapshot, icons=None) -> dict:
+        return self.renderer.render(snapshot, icons=icons)
+
+    def render_full(self, snapshot) -> dict:
+        """The day's card with every detail, for the web board."""
+        return self.renderer.render_full(snapshot)
+
+    def task_verdicts(self, snapshot) -> dict:
+        """How the card counts each task today (see CardRenderer.verdicts)."""
+        return self.renderer.verdicts(snapshot)
 
     def previous_display(self, day: str):
         snapshot = BoardStore.latest_snapshot(self.board_db, self.catalog.project, day)
@@ -104,7 +113,13 @@ class Project:
     def new_projection(self, now=None, *, restore=True) -> Projection:
         day = self.schedule.service_day(now)
         previous = self.previous_display(day) if restore else None
-        return Projection(self.catalog, self.schedule, now, previous)
+        earlier = None
+        if restore and previous is None:
+            # A new day: failure streaks continue from the last card of the day before.
+            earlier = self.previous_display(
+                (date.fromisoformat(day) - timedelta(days=1)).isoformat()
+            )
+        return Projection(self.catalog, self.schedule, now, previous, earlier)
 
     # -- worker hooks ----------------------------------------------------------
 

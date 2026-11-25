@@ -1,6 +1,7 @@
 """Projection behaviour (ported from yslzm/tests/test_daily_board_model.py, plus new cases)."""
 
 from datetime import datetime, timedelta
+from copy import copy
 import json
 
 from autocontrol.board.projection import Projection
@@ -11,8 +12,8 @@ NOW = datetime(2026, 11, 17, 9, 0, tzinfo=BEIJING)
 GOALS = [key for key, spec in CATALOG.tasks.items() if spec.kind == 'goal']
 
 
-def new(now=NOW, previous=None):
-    return Projection(CATALOG, SCHEDULE, now, previous)
+def new(now=NOW, previous=None, earlier=None):
+    return Projection(CATALOG, SCHEDULE, now, previous, earlier)
 
 
 def task(projection, key):
@@ -99,6 +100,47 @@ def test_substep_completion_does_not_complete_parent():
     assert task(projection, 'guild_daily')['status'] == 'complete'
     assert task(projection, 'guild')['status'] == 'not_started'
     assert projection.snapshot()['summary']['completed'] == 0
+
+
+def test_new_direct_outcomes_replace_old_error_codes_without_erasing_progress():
+    catalog = copy(CATALOG)
+    catalog.units = catalog.units | {'错误码', '负错误码'}
+    projection = Projection(catalog, SCHEDULE, NOW)
+
+    def finish(**fields):
+        projection.apply_event({'kind': 'task_finished', 'task_id': 'arena', **fields})
+        return task(projection, 'arena')
+
+    assert finish(status='failed', current=77, unit='错误码')['current'] == 77
+    projection.apply_event({'kind': 'task_started', 'task_id': 'arena'})
+    assert task(projection, 'arena')['current'] == 77
+    row = finish(status='failed')
+    assert 'current' not in row and 'unit' not in row
+    assert finish(status='failed', current=1, unit='负错误码')['unit'] == '负错误码'
+    row = finish(status='failed', current=42, unit='错误码')
+    assert (row['current'], row['unit']) == (42, '错误码')
+    row = finish(status='failed', current=8, total=10, unit='个')
+    assert (row['current'], row['total'], row['unit']) == (8, 10, '个')
+    row = finish(status='failed', unit='错误码')
+    assert 'current' not in row and 'total' not in row
+
+
+def test_final_result_updates_do_not_inherit_prior_error_code():
+    catalog = copy(CATALOG)
+    catalog.units = catalog.units | {'错误码'}
+    projection = Projection(catalog, SCHEDULE, NOW)
+    projection.apply_event(
+        {
+            'kind': 'task_finished',
+            'task_id': 'arena',
+            'status': 'failed',
+            'current': 77,
+            'unit': '错误码',
+        }
+    )
+    projection.apply_result({'phase': 'auto', 'updates': [('arena', {'status': 'failed'})]})
+    row = task(projection, 'arena')
+    assert 'current' not in row and 'unit' not in row
 
 
 def test_final_server_goal_facts_replace_live_progress():
@@ -223,7 +265,7 @@ def test_unreturned_running_item_is_not_left_running_at_end():
     assert task(projection, 'pets')['reason'] == 'ended_without_result'
 
 
-def test_candidates_are_live_only_and_clock_advances_after_long_run():
+def test_a_passed_candidate_is_dropped_and_the_clock_advances_after_a_long_run():
     projection = new()
     candidate = NOW + timedelta(minutes=5)
     projection.apply_event(
@@ -437,6 +479,39 @@ def test_a_round_task_harvested_this_round_stays_done_for_the_round():
     assert task(later, 'pets')['status'] == 'incomplete'
 
 
+def test_a_manifest_round_task_is_done_for_the_round_its_execution_harvested(tmp_path):
+    from autocontrol.projects.manifest import ManifestProject
+
+    from .helpers import demo_copy
+
+    manifest = demo_copy(tmp_path, tasks=[
+        {'id': 'signin', 'title': '每日签到', 'section': 'daily'},
+        {'id': 'income', 'title': '城镇收益', 'section': 'daily', 'demand': 'round'},
+    ])  # fmt: skip
+    project = ManifestProject(manifest)
+    regrown = {'income': {'status': 'waiting', 'next_run_at': '2026-11-17T12:00:00+08:00'}}
+
+    def plan(view):
+        view.apply_event({'kind': 'plan', 'plan': {'full_checklist_summary': {'goals': regrown}}})
+
+    def income(view):
+        return next(row for row in view.snapshot()['tasks'] if row['task_id'] == 'income')
+
+    view = Projection(project.catalog, project.schedule, '2026-11-17T10:00:00+08:00')
+    plan(view)
+    view.apply_event({'kind': 'task_started', 'task_id': 'income'})
+    view.apply_result({'phase': 'daily', 'updates': [('income', {'status': 'complete'})]})
+    plan(view)  # it yields again later in the same round
+    assert (income(view)['status'], income(view)['reason']) == ('complete', 'round_harvested')
+    card = json.dumps(project.render(view.snapshot()), ensure_ascii=False)
+    assert '城镇收益' in card and '1/2' in card
+    # The next round decides afresh: a plan alone never harvests it.
+    later = Projection(project.catalog, project.schedule, '2026-11-17T12:00:00+08:00',
+                       previous=view.snapshot())  # fmt: skip
+    plan(later)
+    assert income(later)['status'] == 'waiting'
+
+
 def test_pets_left_only_with_sleeping_or_sick_pets_are_harvested():
     projection = new()
     projection.apply_event(
@@ -648,3 +723,448 @@ def test_a_window_activity_keeps_todays_outcome_after_it_closes(tmp_path):
     plan(later, {'fair': {'status': 'closed'}, 'event': {'status': 'closed'}})
     again = {row['task_id']: row for row in later.snapshot()['tasks']}
     assert again['fair']['reason'] == 'window_ended' and again['event']['status'] == 'complete'
+
+
+UNKNOWN = {'status': 'result_unavailable', 'reason': 'action_exception'}
+
+
+def test_a_phase_that_sent_no_request_keeps_what_was_known_today():
+    earlier = new()
+    for key, status in (('arena', 'complete'), ('guild', 'waiting'), ('first_clears', 'blocked')):
+        earlier.apply_event({'kind': 'task_finished', 'task_id': key, 'status': status})
+    projection = new(NOW + timedelta(hours=1), previous=earlier.snapshot())
+    projection.apply_event({'kind': 'phase_started', 'phase': 'auto'})
+    keys = ('arena', 'guild', 'first_clears', 'pets')
+    # A login that failed before any request: every task is reported unknown.
+    projection.apply_event({'kind': 'plan', 'plan': {'goals': {key: UNKNOWN for key in keys}}})
+    projection.apply_result({'phase': 'auto', 'execution': 'failed', 'reason': 'login',
+                             'updates': [(key, UNKNOWN) for key in keys]})  # fmt: skip
+    projection.keep_known()
+    assert [task(projection, key)['status'] for key in keys] == [
+        'complete',
+        'waiting',
+        'blocked',
+        'not_started',  # nothing was done: not a result to check
+    ]
+    assert not task(projection, 'arena')['seen']
+    phase = projection.snapshot()['phases'][-1]
+    assert (phase['phase'], phase['status']) == ('auto', 'failed')
+
+
+def test_keeping_what_was_known_keeps_new_facts_and_ends_unfinished_work():
+    projection = new()
+    projection.apply_event({'kind': 'task_finished', 'task_id': 'arena', 'status': 'complete'})
+    projection.apply_event({'kind': 'phase_started', 'phase': 'auto'})
+    projection.apply_event({'kind': 'task_started', 'task_id': 'arena'})
+    projection.apply_event({'kind': 'task_finished', 'task_id': 'guild', 'status': 'blocked'})
+    projection.keep_known()
+    assert task(projection, 'arena')['status'] == 'complete'
+    assert task(projection, 'guild')['status'] == 'blocked'
+
+
+def test_only_a_phase_without_requests_keeps_what_was_known():
+    projection = new()
+    projection.apply_event({'kind': 'task_finished', 'task_id': 'guild', 'status': 'waiting'})
+    projection.apply_event({'kind': 'phase_started', 'phase': 'auto'})
+    projection.apply_result(
+        {'phase': 'auto', 'execution': 'failed', 'updates': [('guild', UNKNOWN)]}
+    )
+    # Without keep_known (requests were sent), the unknown result stays visible.
+    assert task(projection, 'guild')['status'] == 'result_unavailable'
+
+
+def test_keeping_what_was_known_also_undoes_a_spurious_request_problem():
+    projection = new()
+    projection.apply_event({'kind': 'task_finished', 'task_id': 'red_dots', 'status': 'complete',
+                            'counts': {'unsupported': 1}})  # fmt: skip
+    projection.apply_event({'kind': 'task_finished', 'task_id': 'pets', 'status': 'unknown'})
+    before = {key: task(projection, key) for key in ('red_dots', 'pets')}
+    projection.apply_event({'kind': 'phase_started', 'phase': 'auto'})
+    projection.apply_result({'phase': 'auto', 'execution': 'failed',
+                             'updates': [('red_dots', UNKNOWN), ('pets', UNKNOWN)]})  # fmt: skip
+    assert task(projection, 'red_dots')['reason'] == 'action_exception'
+    projection.keep_known()
+    assert {key: task(projection, key) for key in before} == before
+
+
+def done_row(projection, key):
+    found = task(projection, key)
+    return found['status'], found.get('done_at'), found.get('done_how'), found.get('trouble')
+
+
+def test_a_completion_keeps_its_time_and_how_it_came_after_trouble():
+    projection = new()
+    at = lambda minutes: (NOW + timedelta(minutes=minutes)).timestamp()  # noqa: E731
+    projection.apply_event({'kind': 'task_finished', 'task_id': 'arena', 'status': 'complete',
+                            'observed_at': at(5)})  # fmt: skip
+    projection.apply_event({'kind': 'task_failed', 'task_id': 'guild', 'reason': 'action_exception',
+                            'observed_at': at(6)})  # fmt: skip
+    projection.apply_event({'kind': 'task_failed', 'task_id': 'pets', 'status': 'uncertain',
+                            'reason': 'request_result_missing', 'observed_at': at(7)})  # fmt: skip
+    assert done_row(projection, 'guild')[3] == 'failed'
+    assert done_row(projection, 'pets')[3] == 'unknown'
+    projection.apply_result({'phase': 'auto', 'execution': 'complete',
+                             'finished_at': (NOW + timedelta(minutes=30)).isoformat(),
+                             'updates': [('guild', {'status': 'complete'}), ('pets', {'status': 'complete'})]})  # fmt: skip
+    first = (NOW + timedelta(minutes=5)).isoformat(timespec='seconds')
+    later = (NOW + timedelta(minutes=30)).isoformat(timespec='seconds')
+    assert done_row(projection, 'arena') == ('complete', first, None, None)
+    assert done_row(projection, 'guild') == ('complete', later, 'retry', None)
+    assert done_row(projection, 'pets') == ('complete', later, 'confirm', None)
+    # A later report of the same completion keeps the first time.
+    projection.apply_event({'kind': 'task_finished', 'task_id': 'arena', 'status': 'complete',
+                            'observed_at': at(50)})  # fmt: skip
+    assert done_row(projection, 'arena')[1] == first
+    # The next round restores it from the saved card. New work reopens it, and
+    # finishing again keeps the day's first completion time.
+    restored = new(NOW + timedelta(hours=1), previous=projection.snapshot())
+    assert done_row(restored, 'guild') == ('complete', later, 'retry', None)
+    restored.apply_event({'kind': 'plan', 'plan': {'goals': {'arena': {'status': 'incomplete'}}}})
+    assert done_row(restored, 'arena')[0] == 'incomplete'
+    restored.apply_event({'kind': 'task_finished', 'task_id': 'arena', 'status': 'complete'})
+    assert done_row(restored, 'arena') == ('complete', first, None, None)
+
+
+def test_a_completion_in_a_round_started_by_hand_is_marked():
+    projection = new()
+    projection.set_manual(True)
+    projection.apply_event({'kind': 'task_finished', 'task_id': 'arena', 'status': 'complete'})
+    assert done_row(projection, 'arena')[2] == 'manual'
+
+
+def test_the_saved_card_keeps_completion_history():
+    from autocontrol.lark.store import sanitize_snapshot
+
+    projection = new()
+    projection.apply_event(
+        {'kind': 'task_failed', 'task_id': 'guild', 'reason': 'action_exception'}
+    )
+    projection.apply_event({'kind': 'task_finished', 'task_id': 'guild', 'status': 'complete'})
+    saved = sanitize_snapshot(projection.snapshot(), count_keys=CATALOG.count_keys)
+    row = next(r for r in saved['tasks'] if r['task_id'] == 'guild')
+    assert (row['done_how'], row['done_at']) == ('retry', NOW.isoformat(timespec='seconds'))
+
+
+def test_an_unknown_window_state_is_no_evidence_and_settled_rows_survive_the_close(tmp_path):
+    from autocontrol.projects.manifest import ManifestProject
+
+    from .helpers import demo_copy
+
+    window = {'section': 'daily', 'demand': 'window'}
+    keys = ('dim', 'blind', 'seen', 'capped', 'odd')
+    manifest = demo_copy(tmp_path, tasks=[
+        {'id': 'signin', 'title': '每日签到', 'section': 'daily'},
+        *({'id': key, 'title': key, **window} for key in keys),
+    ])  # fmt: skip
+    project = ManifestProject(manifest)
+    view = Projection(project.catalog, project.schedule, '2026-11-17T10:00:00+08:00')
+
+    def plan(goals):
+        view.apply_event({'kind': 'plan', 'plan': {'full_checklist_summary': {'goals': goals}}})
+
+    plan({
+        'dim': {'status': 'result_unavailable'},  # a read-only plan that could not tell
+        'blind': {'status': 'not_started', 'availability': 'unknown'},
+        'seen': {'status': 'result_unavailable', 'availability': 'open'},
+        'capped': {'status': 'waiting', 'reason': 'done_for_today'},
+        'odd': {'status': 'unsupported'},
+    })  # fmt: skip
+    plan({key: {'status': 'closed'} for key in keys})
+    rows = {row['task_id']: row for row in view.snapshot()['tasks']}
+    assert rows['dim']['status'] == 'closed' and 'opened' not in rows['dim']
+    assert rows['blind']['status'] == 'closed' and 'opened' not in rows['blind']
+    # Open but unknown: the day's outcome stays unknown rather than "missed".
+    assert rows['seen']['status'] == 'result_unavailable' and rows['seen']['opened'] is True
+    assert (rows['capped']['status'], rows['capped']['reason']) == ('waiting', 'done_for_today')
+    assert rows['odd']['status'] == 'unsupported'
+
+
+def test_a_window_activity_done_today_is_not_undone_by_a_later_read(tmp_path):
+    from autocontrol.projects.manifest import ManifestProject
+
+    from .helpers import demo_copy
+
+    manifest = demo_copy(tmp_path, tasks=[
+        {'id': 'signin', 'title': '每日签到', 'section': 'daily'},
+        {'id': 'boss', 'title': '限时首领', 'section': 'daily', 'demand': 'window'},
+    ])  # fmt: skip
+    project = ManifestProject(manifest)
+    view = Projection(project.catalog, project.schedule, '2026-11-17T10:00:00+08:00')
+
+    def plan(goals):
+        view.apply_event({'kind': 'plan', 'plan': {'full_checklist_summary': {'goals': goals}}})
+
+    def boss():
+        return next(row for row in view.snapshot()['tasks'] if row['task_id'] == 'boss')
+
+    plan({'boss': {'status': 'incomplete'}})
+    view.apply_event({'kind': 'task_finished', 'task_id': 'boss', 'status': 'complete'})
+    plan({'boss': {'status': 'incomplete'}})  # a read that cannot see today's fights
+    assert boss()['status'] == 'complete'
+    plan({'boss': {'status': 'closed'}})
+    assert boss()['status'] == 'complete'  # never "missed"
+    later = datetime(2026, 11, 17, 19, tzinfo=BEIJING).timestamp()
+    plan({'boss': {'status': 'waiting', 'reason': 'not_open', 'next_run_at': later}})
+    assert boss()['status'] == 'waiting'  # a second window today is still shown
+
+
+def test_a_window_task_that_only_started_and_then_found_it_closed_is_not_missed(tmp_path):
+    from autocontrol.projects.manifest import ManifestProject
+
+    from .helpers import demo_copy
+
+    manifest = demo_copy(tmp_path, tasks=[
+        {'id': 'signin', 'title': '每日签到', 'section': 'daily'},
+        {'id': 'fair', 'title': '庙会', 'section': 'daily', 'demand': 'window'},
+    ])  # fmt: skip
+    project = ManifestProject(manifest)
+    view = Projection(project.catalog, project.schedule, '2026-11-17T06:09:00+08:00')
+    view.apply_event({'kind': 'task_started', 'task_id': 'fair'})
+    view.apply_event({'kind': 'task_finished', 'task_id': 'fair', 'status': 'closed'})
+    fair = next(row for row in view.snapshot()['tasks'] if row['task_id'] == 'fair')
+    assert fair['status'] == 'closed' and 'opened' not in fair  # hidden, never "missed"
+
+
+def test_a_window_task_started_again_is_judged_by_how_its_day_stood_when_it_finds_it_closed(
+    tmp_path,
+):
+    from autocontrol.projects.manifest import ManifestProject
+
+    from .helpers import demo_copy
+
+    window = {'section': 'daily', 'demand': 'window'}
+    manifest = demo_copy(tmp_path, tasks=[
+        {'id': 'signin', 'title': '每日签到', 'section': 'daily'},
+        {'id': 'event', 'title': '限时活动', **window},
+        {'id': 'fair', 'title': '庙会', **window},
+        {'id': 'expo', 'title': '展会', **window},
+    ])  # fmt: skip
+    project = ManifestProject(manifest)
+    view = Projection(project.catalog, project.schedule, '2026-11-17T10:00:00+08:00')
+    goals = {key: {'status': 'incomplete'} for key in ('event', 'fair', 'expo')}
+    view.apply_event({'kind': 'plan', 'plan': {'full_checklist_summary': {'goals': goals}}})
+    view.apply_event({'kind': 'task_finished', 'task_id': 'event', 'status': 'complete'})
+    view.apply_event({'kind': 'task_finished', 'task_id': 'fair', 'status': 'timeout'})
+    done_at = next(row for row in view.snapshot()['tasks'] if row['task_id'] == 'event')['done_at']
+    # A later round starts every activity again and each finds its window closed.
+    for key in ('event', 'fair', 'expo'):
+        view.apply_event({'kind': 'task_started', 'task_id': key})
+        view.apply_event({'kind': 'task_finished', 'task_id': key, 'status': 'closed'})
+    view.finish_run()
+    rows = {row['task_id']: row for row in view.snapshot()['tasks']}
+    assert rows['event']['status'] == 'complete' and rows['event']['done_at'] == done_at
+    assert (rows['fair']['status'], rows['fair']['reason']) == ('result_unavailable', 'timeout')
+    assert (rows['expo']['status'], rows['expo']['reason']) == ('incomplete', 'window_ended')
+    card = json.dumps(project.render(view.snapshot()), ensure_ascii=False)
+    assert "限时活动　<font color='grey'>已错过" not in card and "庙会　<font color='grey'>已错过" not in card
+
+
+def test_a_read_only_plan_does_not_undo_a_window_done_today_while_it_runs_again(tmp_path):
+    from autocontrol.projects.manifest import ManifestProject
+
+    from .helpers import demo_copy
+
+    manifest = demo_copy(tmp_path, tasks=[
+        {'id': 'signin', 'title': '每日签到', 'section': 'daily'},
+        {'id': 'fair', 'title': '庙会', 'section': 'daily', 'demand': 'window'},
+    ])  # fmt: skip
+    project = ManifestProject(manifest)
+    view = Projection(project.catalog, project.schedule, '2026-11-17T10:00:00+08:00')
+
+    def plan(status):
+        goals = {'fair': {'status': status}}
+        view.apply_event({'kind': 'plan', 'plan': {'full_checklist_summary': {'goals': goals}}})
+
+    def fair():
+        return next(row for row in view.snapshot()['tasks'] if row['task_id'] == 'fair')
+
+    plan('incomplete')
+    view.apply_result({'phase': 'daily', 'updates': [('fair', {'status': 'complete'})]})
+    view.apply_event({'kind': 'phase_started', 'phase': 'daily'})
+    view.apply_event({'kind': 'task_started', 'task_id': 'fair'})
+    plan('incomplete')  # a read-only plan cannot see today's participation
+    assert fair()['status'] == 'running'
+    plan('closed')
+    assert fair()['status'] == 'complete' and fair()['done_at']
+
+
+def test_wakes_reported_earlier_survive_a_failed_or_partial_round(tmp_path):
+    from autocontrol.projects.manifest import ManifestProject
+
+    from .helpers import demo_copy
+
+    data = json.loads((demo_copy(tmp_path)).read_text())
+    data['schedule']['phases'] = {'shop': {'times': ['07:00', '15:00']}}
+    path = tmp_path / 'demo' / 'autocontrol.json'
+    path.write_text(json.dumps(data, ensure_ascii=False))
+    project = ManifestProject(path)
+    start = datetime.fromisoformat('2026-11-17T09:00:00+08:00')
+    first = project.new_projection(start, restore=False)
+    shop, daily = start + timedelta(hours=1), start + timedelta(hours=2)
+    first.apply_result({'phase': 'shop', 'execution': 'waiting', 'finished_at': start.isoformat(),
+                        'updates': [], 'dynamic_candidates': [shop.timestamp()]})  # fmt: skip
+    first.apply_result({'phase': 'daily', 'execution': 'partial', 'finished_at': start.isoformat(),
+                        'updates': [], 'dynamic_candidates': [daily.timestamp()]})  # fmt: skip
+    saved = project.sanitize(first.snapshot())
+
+    later = start + timedelta(minutes=20)
+    failed = Projection(project.catalog, project.schedule, later, saved)
+    failed.apply_result({'phase': 'daily', 'execution': 'failed', 'finished_at': later.isoformat(),
+                         'updates': [], 'reason': 'connect'})  # fmt: skip
+    assert failed.dynamic_candidates == (shop.timestamp(), daily.timestamp())  # nothing lost
+    assert failed.dynamic_owners[shop.timestamp()] == {'shop'}
+
+    again = Projection(
+        project.catalog, project.schedule, later, project.sanitize(failed.snapshot())
+    )
+    newer = start + timedelta(minutes=90)
+    again.apply_result({'phase': 'shop', 'execution': 'waiting', 'finished_at': later.isoformat(),
+                        'updates': [], 'dynamic_candidates': [newer.timestamp()]})  # fmt: skip
+    # The shop phase ran: its new time replaces its old one; the daily phase's stays.
+    assert again.dynamic_candidates == (newer.timestamp(), daily.timestamp())
+    gone = Projection(project.catalog, project.schedule, daily + timedelta(minutes=1),
+                      project.sanitize(again.snapshot()))  # fmt: skip
+    assert gone.dynamic_candidates == ()  # passed times are not carried
+
+
+def test_a_new_state_drops_the_time_of_the_state_it_replaced():
+    projection = new()
+    soon = (NOW + timedelta(hours=2)).isoformat(timespec='seconds')
+    wait = {'status': 'waiting', 'reason': 'waiting_for_completion'}
+    projection.apply_event(
+        {'kind': 'task_finished', 'task_id': 'arena', **wait, 'next_run_at': soon}
+    )
+    # The same wait read again without a time keeps it: absence of evidence,
+    # also when a plan's bare read lacks the reason.
+    projection.apply_event({'kind': 'plan', 'plan': {'goals': {'arena': dict(wait)}}})
+    projection.apply_event({'kind': 'plan', 'plan': {'goals': {'arena': {'status': 'waiting'}}}})
+    assert task(projection, 'arena')['next_run_at'] == soon
+    # A failure replaces the wait; the wait's time no longer applies.
+    projection.apply_event(
+        {'kind': 'task_failed', 'task_id': 'arena', 'reason': 'action_exception'}
+    )
+    assert 'next_run_at' not in task(projection, 'arena')
+    # Done for today replaces a timed wait the same way.
+    projection.apply_event(
+        {'kind': 'task_finished', 'task_id': 'guild', **wait, 'next_run_at': soon}
+    )
+    projection.apply_event({'kind': 'task_finished', 'task_id': 'guild', 'status': 'waiting',
+                            'reason': 'quota_cap'})  # fmt: skip
+    assert 'next_run_at' not in task(projection, 'guild')
+    # A start alone is no new state: the time stays until the task reports.
+    projection.apply_event(
+        {'kind': 'task_finished', 'task_id': 'bear', **wait, 'next_run_at': soon}
+    )
+    projection.apply_event({'kind': 'task_started', 'task_id': 'bear'})
+    assert task(projection, 'bear')['next_run_at'] == soon
+
+
+def streak(view, key='guild'):
+    return task(view, key).get('fail_streak')
+
+
+def test_failure_streaks_count_failed_rounds_and_continue_into_the_next_day():
+    from autocontrol.lark.store import sanitize_snapshot
+
+    failed = {'kind': 'task_failed', 'task_id': 'guild', 'reason': 'action_exception'}
+    first = new()
+    first.apply_event(failed)
+    first.finish_run(NOW + timedelta(minutes=5))
+    assert streak(first) == 1
+    saved = sanitize_snapshot(first.snapshot(), count_keys=CATALOG.count_keys)
+    second = new(NOW + timedelta(hours=2), previous=saved)
+    second.apply_event(failed)
+    second.finish_run(NOW + timedelta(hours=2, minutes=5))
+    assert streak(second) == 2
+    # A round that does not report the task neither extends nor ends it.
+    third = new(NOW + timedelta(hours=4), previous=second.snapshot())
+    third.apply_event({'kind': 'task_finished', 'task_id': 'arena', 'status': 'complete'})
+    third.finish_run(NOW + timedelta(hours=4, minutes=5))
+    assert streak(third) == 2 and streak(third, 'arena') is None
+    # The next service day starts from the last card of the day before.
+    tomorrow = NOW + timedelta(days=1)
+    fourth = new(tomorrow, earlier=third.snapshot())
+    assert fourth.day == '2026-11-18' and streak(fourth) == 2
+    fourth.apply_event(failed)
+    fourth.finish_run(tomorrow + timedelta(minutes=5))
+    assert streak(fourth) == 3
+    # Any other outcome ends it.
+    fourth.apply_event({'kind': 'task_finished', 'task_id': 'guild', 'status': 'complete'})
+    fourth.finish_run(tomorrow + timedelta(minutes=10))
+    assert streak(fourth) is None
+    # A day that ended without the failure carries nothing over.
+    assert streak(new(tomorrow + timedelta(days=1), earlier=fourth.snapshot())) is None
+
+
+def test_per_round_work_shows_the_time_of_this_rounds_harvest(tmp_path):
+    from autocontrol.projects.manifest import ManifestProject
+
+    from .helpers import demo_copy
+
+    manifest = demo_copy(tmp_path, tasks=[
+        {'id': 'signin', 'title': '每日签到', 'section': 'daily'},
+        {'id': 'income', 'title': '城镇收益', 'section': 'daily', 'demand': 'round'},
+    ])  # fmt: skip
+    project = ManifestProject(manifest)
+
+    def income(view):
+        return next(row for row in view.snapshot()['tasks'] if row['task_id'] == 'income')
+
+    def harvest(view, when):
+        view.apply_result({'phase': 'daily', 'finished_at': when,
+                           'updates': [('income', {'status': 'complete'})]})  # fmt: skip
+
+    view = Projection(project.catalog, project.schedule, '2026-11-17T10:00:00+08:00')
+    harvest(view, '2026-11-17T10:05:00+08:00')
+    assert income(view)['done_at'] == '2026-11-17T10:05:00+08:00'
+    later = Projection(project.catalog, project.schedule, '2026-11-17T12:00:00+08:00',
+                       previous=view.snapshot())  # fmt: skip
+    regrown = {'income': {'status': 'waiting', 'next_run_at': '2026-11-17T14:00:00+08:00'}}
+    later.apply_event({'kind': 'plan', 'plan': {'full_checklist_summary': {'goals': regrown}}})
+    harvest(later, '2026-11-17T12:05:00+08:00')
+    assert income(later)['done_at'] == '2026-11-17T12:05:00+08:00'
+
+
+def restarted(key, earlier, outcome, *, via_result=False):
+    """``key`` finished as ``earlier`` at 09:00, then a 13:00 round started it again."""
+    first = new()
+    first.apply_event({'kind': 'task_finished', 'task_id': key, **earlier})
+    first.finish_run(NOW + timedelta(minutes=10))
+    later = NOW + timedelta(hours=4)
+    projection = new(later, first.snapshot())
+    projection.apply_event({'kind': 'task_started', 'task_id': key})
+    assert task(projection, key)['status'] == 'running'
+    if via_result:
+        projection.apply_result(
+            {'phase': 'auto', 'execution': 'complete', 'updates': [(key, outcome)]}
+        )
+    else:
+        projection.apply_event({'kind': 'task_finished', 'task_id': key, **outcome})
+    projection.finish_run(later + timedelta(minutes=5))
+    return task(first, key), task(projection, key)
+
+
+def test_work_done_earlier_today_stays_done_when_its_restart_returns_only_unknown():
+    for via_result in (False, True):
+        before, row = restarted(
+            'arena', {'status': 'complete'}, {'status': 'unknown'}, via_result=via_result
+        )
+        assert (row['status'], row['reason']) == ('complete', 'completed_observation_retained')
+        assert row['done_at'] == before['done_at']
+
+
+def test_a_restart_returning_only_unknown_leaves_other_work_unknown():
+    for key, earlier, outcome in (
+        # not done before it started: the round may have changed it
+        ('arena', {'status': 'prepared'}, {'status': 'unknown'}),
+        # a request went out and its answer is missing
+        (
+            'arena',
+            {'status': 'complete'},
+            {'status': 'uncertain', 'reason': 'request_result_missing'},
+        ),
+        # per-round work: this round's own outcome decides
+        ('pets', {'status': 'complete'}, {'status': 'unknown'}),
+    ):
+        _, row = restarted(key, earlier, outcome)
+        assert row['status'] == 'result_unavailable', (key, earlier, outcome)

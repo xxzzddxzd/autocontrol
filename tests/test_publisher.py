@@ -509,3 +509,65 @@ def test_invalid_snapshots_are_refused_without_raising(private):
     assert card.submit(None) is False
     assert card.submit({'project': 'yslzm'}) is False
     card.close()
+
+
+def test_client_uploads_a_card_image_as_multipart():
+    calls = []
+
+    def transport(method, url, headers, body, timeout):
+        calls.append((method, url, headers, body))
+        if '/auth/' in url:
+            return {'code': 0, 'tenant_access_token': 'memory_only_token', 'expire': 7200}
+        return {'code': 0, 'data': {'image_key': 'img_v3_spinner'}}
+
+    client = FeishuClient(CONFIG, request_json=transport)
+    assert client.upload_image(b'RIFF-webp-bytes', 'spinner.webp', 'image/webp') == 'img_v3_spinner'
+    method, url, headers, body = calls[1]
+    assert (method, url) == ('POST', 'https://open.feishu.cn/open-apis/im/v1/images')
+    assert headers['Content-Type'].startswith('multipart/form-data; boundary=')
+    assert headers['Authorization'] == 'Bearer memory_only_token'
+    assert b'name="image_type"\r\n\r\nmessage' in body and b'RIFF-webp-bytes' in body
+    assert client.app_fingerprint != CONFIG['app_id'] and len(client.app_fingerprint) == 16
+    with pytest.raises(DeliveryError):
+        client.upload_image(b'', 'empty.webp', 'image/webp')
+
+
+class SpinnerClient(FakeClient):
+    app_fingerprint = 'bot-test'
+
+    def __init__(self, fail=False):
+        super().__init__()
+        self.fail, self.uploads = fail, 0
+
+    def upload_image(self, data, filename, content_type):
+        self.uploads += 1
+        if self.fail:
+            raise DeliveryError('permission_denied', api_code=99991672)
+        return 'img_v3_spinner'
+
+
+def test_publisher_renders_with_the_uploaded_spinner_or_without_it(private):
+    seen = []
+
+    def render_icons(value, icons=None):
+        seen.append(icons)
+        return render(value)
+
+    write_config(private)
+    client = SpinnerClient()
+    sender = CardPublisher(private, render_icons, SANITIZE, client_factory=lambda config: client,
+                           min_interval=0)  # fmt: skip
+    assert sender.submit(snapshot()) and sender.submit(snapshot(2))
+    assert sender.close()
+    assert seen and all(icons == {'spinner': 'img_v3_spinner'} for icons in seen)
+    assert client.uploads == 1  # cached in the private directory afterwards
+    failing = SpinnerClient(fail=True)
+    seen.clear()
+    other = tmp = private.parent / 'other'
+    tmp.mkdir(mode=0o700)
+    write_config(other)
+    sender = CardPublisher(other, render_icons, SANITIZE, client_factory=lambda config: failing,
+                           min_interval=0)  # fmt: skip
+    assert sender.submit(snapshot())
+    assert sender.close()
+    assert seen == [None] and failing.sent  # the card still goes out, with the static icon

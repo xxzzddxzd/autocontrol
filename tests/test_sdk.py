@@ -77,6 +77,7 @@ def test_events_and_result_pass_the_console_validators(pipe):
 def test_works_outside_the_console():
     out = io.StringIO()
     worker = sdk.Worker(environ={}, stdin=io.StringIO(''), stdout=out)
+    assert worker.observe  # run by hand, a script only reads
     assert worker.emit('plan', tasks={}) is False
     worker.finish('complete', {})
     assert json.loads(out.getvalue().strip())['outcome'] == 'complete'

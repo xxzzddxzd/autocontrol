@@ -55,18 +55,27 @@ def _element(element: dict) -> str:
     if tag == 'div':
         icon = element.get('icon') or {}
         token = icon.get('token')
-        glyph = {
-            'ellipse_outlined': '',  # drawn as an outlined ring by CSS
-            'record_outlined': '●',
-            'succeed_filled': '✓',
-            'error_filled': '✕',
-            'warning-hollow_filled': '!',
-        }.get(token, '•')
-        ring = ' ring' if token == 'ellipse_outlined' else ''
+        if icon.get('tag') == 'custom_icon' or token == 'loading_outlined':
+            # The uploaded spinner (or its static stand-in): a turning blue ring.
+            return (
+                '<div class="todo"><span class="mark ring spin"></span>'
+                f'<span class="text">{_inline(element.get("text", {}).get("content", ""))}</span></div>'
+            )
+        glyph, shape = {
+            'ellipse_outlined': ('', ' ring'),
+            'yes_outlined': ('✓', ' ring'),
+            'warning_outlined': ('!', ' ring'),
+            'maybe_outlined': ('?', ' ring'),
+            'time_outlined': ('', ' ring clock'),
+            'record_outlined': ('●', ''),
+            'succeed_filled': ('✓', ''),
+            'error_filled': ('✕', ''),
+            'warning-hollow_filled': ('!', ''),
+        }.get(token, ('•', ''))
         color = COLORS.get(icon.get('color'), '#646a73')
         text = _inline(element.get('text', {}).get('content', ''))
         return (
-            f'<div class="todo"><span class="mark{ring}" style="color:{color};border-color:{color}">'
+            f'<div class="todo"><span class="mark{shape}" style="color:{color};border-color:{color}">'
             f'{glyph}</span><span class="text">{text}</span></div>'
         )
     if tag == 'collapsible_panel':
@@ -115,8 +124,17 @@ def card_html(card: dict, *, title: str = '卡片预览') -> str:
   .todo.done .box {{ background: #3370ff; border-color: #3370ff; }}
   .mark {{ flex: none; width: 14px; height: 14px; margin-top: 3px; font-size: 12px; font-weight: 700;
            line-height: 14px; text-align: center; }}
-  .mark.ring {{ box-sizing: border-box; width: 12px; height: 12px; margin: 4px 1px 0;
-                border: 1.5px solid; border-radius: 50%; }}
+  .mark.ring {{ box-sizing: border-box; width: 13px; height: 13px; margin: 3.5px 0.5px 0;
+                border: 1.4px solid; border-radius: 50%; font-size: 8px; line-height: 10px;
+                position: relative; }}
+  .mark.spin {{ border-color: #3370ff; border-top-color: transparent;
+                animation: spin 1.08s linear infinite; }}
+  @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
+  .mark.clock::before, .mark.clock::after {{ content: ""; position: absolute; left: 4.6px;
+                background: currentColor; width: 1.3px; border-radius: 1px; }}
+  .mark.clock::before {{ top: 2px; height: 4.2px; }}
+  .mark.clock::after {{ top: 5px; height: 3.4px; transform: rotate(-90deg);
+                        transform-origin: 50% 0.6px; left: 4.6px; }}
   .todo.done .text {{ text-decoration: line-through; opacity: .5; }}
   .md.small {{ font-size: 12px; }}
   .md.indent {{ margin: -4px 0 0 24px; }}

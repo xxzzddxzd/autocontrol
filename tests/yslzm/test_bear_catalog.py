@@ -6,6 +6,7 @@ import json
 import pytest
 
 from autocontrol.board.projection import Projection
+from autocontrol.projects.yslzm import summary as rules
 from autocontrol.projects.yslzm.catalog import CATALOG, SCHEDULE
 from autocontrol.schedule import BEIJING
 
@@ -47,6 +48,29 @@ def test_actual_bear_job_survives_adapter_translation_and_has_the_right_card_sta
         assert rows['bear']['reason'] == 'insufficient_resources'
     assert rows['activities']['status'] == 'not_started'
     assert '寻找贪吃熊' in json.dumps(project.render(projection.snapshot()), ensure_ascii=False)
+
+
+@pytest.mark.parametrize(
+    ('native', 'expected'), (('insufficient_resources', 'blocked'), ('available', 'incomplete'))
+)
+def test_native_bear_state_survives_the_result_whitelist_into_the_card(project, native, expected):
+    # 2026-11-21: score 140 < cake price 150 reached the card as 状态未返回,
+    # because the result whitelist turned insufficient_resources into unrecognized.
+    jobs = {name: [{'status': 'closed'}] for name in rules.PHASE_JOBS['activities']}
+    jobs['bear'] = [
+        {'kind': 'bear', 'status': native, 'score': 140, 'buy_used': 0, 'buy_target': 3}
+    ]
+    summary = {'game_day': '2026-11-17', 'policy_jobs': jobs}
+    record = rules.summarize('activities', '2026-11-17', 0, summary)
+    assert record['policy_jobs']['bear']['status'] == native
+    projection = Projection(CATALOG, SCHEDULE, NOW)
+    projection.apply_result(project.result_facts({**record, 'command': 'activities'}))
+    bear = next(row for row in projection.snapshot()['tasks'] if row['task_id'] == 'bear')
+    assert bear['status'] == expected
+    text = json.dumps(project.render(projection.snapshot()), ensure_ascii=False)
+    assert '服务器尚未提供该项状态' not in text
+    if native == 'insufficient_resources':
+        assert '资源不足' in text
 
 
 def test_bear_typed_increments_are_retained_without_counting_currency_as_actions(project):

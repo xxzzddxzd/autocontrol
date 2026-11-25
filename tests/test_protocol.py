@@ -163,3 +163,22 @@ def test_exported_schemas_match_the_code_and_accept_the_sdk_output():
         assert (ROOT / 'docs' / 'schemas' / name).read_text(encoding='utf-8') == schemas.render(
             name
         ), f'run: python run.py schema --out docs/schemas ({name} is stale)'
+
+
+def test_outdated_local_config_is_a_standard_reason():
+    from autocontrol import protocol
+
+    assert protocol.STANDARD_REASONS['config_outdated'] == '本地配置落后于游戏版本'
+    assert protocol.STANDARD_SHORT_REASONS['config_outdated'] == '配置待更新'
+
+
+def test_a_protocol_project_may_report_an_outdated_local_config(tmp_path):
+    from .helpers import demo_copy
+
+    project = ManifestProject(demo_copy(tmp_path))
+    report = protocol.Violations()
+    state = protocol.task_state(
+        {'status': 'blocked', 'reason': 'config_outdated'}, project.catalog, report, 't'
+    )
+    assert state == {'status': 'blocked', 'reason': 'config_outdated'} and report.errors == []
+    assert project.catalog.short_reasons['config_outdated'] == '配置待更新'

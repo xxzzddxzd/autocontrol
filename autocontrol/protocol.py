@@ -109,6 +109,7 @@ STANDARD_REASONS = {
     'not_open': '尚未开放',
     'done_for_today': '今日已无可做，明日继续',
     'unsupported': '发现目标，但尚无处理流程',
+    'config_outdated': '本地配置落后于游戏版本',
 }
 STANDARD_SHORT_REASONS = {
     'login_required': '需要登录',
@@ -123,6 +124,7 @@ STANDARD_SHORT_REASONS = {
     'insufficient_materials': '材料不足',
     'waiting_for_stamina': '等待体力',
     'done_for_today': '明日继续',
+    'config_outdated': '配置待更新',
 }
 DAY_DONE_REASONS = ('done_for_today',)
 REQUEST_PROBLEMS = (

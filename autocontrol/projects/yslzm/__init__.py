@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+
 from ..base import Project
+from ... import storage
 from ...worker import run_streamed
 from .catalog import CATALOG, SCHEDULE
 from .phases import (
+    BEIJING,
     DEFAULT_PRIVATE,
     DEFAULT_PROJECT,
     PROGRESS_ENV,
@@ -15,6 +19,73 @@ from .phases import (
     run_round,
     run_scheduled,
 )
+
+# Red-dot sources in the auto phase's final status read, and the step that
+# claims each one.
+SETTLED_SOURCES = {
+    'lottery_sign_coins': 'lottery_sign_coins',  # 追光金币
+    'lottery_sign_ins': 'lottery_sign',  # 追光签到
+    'ui_coin_buttons': 'ui_coin_rewards',  # 页面金币
+    'vvanna_rewards': 'vvanna_reward',  # 玩呐奖励
+    'vvanna_quiz': 'vvanna_quiz',  # 玩呐百科
+    'blind_box_workshop': 'blind_box',  # 盲盒领奖
+    'monthly_sign': 'monthly_sign',  # 每日签到
+    'discount_packages': 'discount_package_reward',  # 降价奖励
+}
+_NOTHING_LEFT = ('claimable', 'claimable_count', 'unknown', 'unsupported')
+
+
+def settled_steps(record) -> list:
+    """Steps the auto phase's final read shows done for now.
+
+    A claim reports ``confirmed`` (未完成 on the card) because the job does
+    not re-read its source afterwards, so only the next round's empty pass
+    (``cleared``) finished the step, hours later. The phase's final status
+    read, taken after both reward passes, already shows it: a reward source
+    with nothing left to claim, the arena goal complete (on Monday the daily
+    job only saves the four schemes and reports ``prepared``; the climb takes
+    the attempts), or both association quotas used. Anything partial,
+    unknown or unsupported stays as the worker reported it.
+    """
+    if type(record) is not dict or record.get('command') != 'auto':
+        return []
+    updates = []
+    details = record.get('feature_details')
+    red = details.get('red_dot_sources') if type(details) is dict else None
+    sources = red.get('sources') if type(red) is dict else None
+    if type(sources) is dict:
+        for name, step in SETTLED_SOURCES.items():
+            row = sources.get(name)
+            if (
+                type(row) is dict
+                and row.get('status') in ('cleared', 'complete')
+                and all(_zero(row, field) for field in _NOTHING_LEFT)
+            ):
+                updates.append((step, {'status': 'cleared'}))
+    checklist = record.get('full_checklist_summary')
+    goals = checklist.get('goals') if type(checklist) is dict else None
+    if type(goals) is dict:
+        arena = goals.get('arena')
+        if type(arena) is dict and arena.get('status') == 'complete':
+            updates.append(('arena_daily', {'status': 'cleared'}))
+        guild = goals.get('guild')
+        counts = guild.get('counts') if type(guild) is dict else None
+        if (
+            type(counts) is dict
+            and _reached(counts, 'support', 3)
+            and _reached(counts, 'inspiration', 5)
+        ):
+            updates.append(('guild_daily', {'status': 'cleared'}))
+    return updates
+
+
+def _zero(row, field) -> bool:
+    return field not in row or (type(row[field]) is int and row[field] == 0)
+
+
+def _reached(counts, name, least) -> bool:
+    used, target = counts.get(name + '_used'), counts.get(name + '_target')
+    return type(used) is int and type(target) is int and used >= target >= least
 
 
 class YslzmProject(Project):
@@ -39,12 +110,16 @@ class YslzmProject(Project):
         return {'uncertain_targets': []}
 
     def observe(self, day, *, on_event, timeout, round_id=None):
+        started = datetime.now(BEIJING)
         result = run_streamed(
             command_line('status', day, python=self.python),
             cwd=self.workdir,
             on_event=on_event,
             progress_env=PROGRESS_ENV,
             timeout=timeout,
+            on_stderr=lambda data: storage.keep_stderr(
+                self.private, started, 'status-observe', data
+            ),
         )
         return result.returncode, latest_summary(result.stdout) or {}
 
@@ -99,6 +174,7 @@ class YslzmProject(Project):
                 updates.append(
                     ('cardbook', {'status': 'result_unavailable', 'reason': 'ended_without_result'})
                 )
+        updates.extend(settled_steps(record))
         checklist = record.get('full_checklist_summary')
         return {
             'phase': phase,
