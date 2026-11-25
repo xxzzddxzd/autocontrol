@@ -389,15 +389,28 @@ def _dashboard_webhook(path, value, *, ask=None) -> int:
     return 0
 
 
+def cards_text(state) -> str:
+    """One line on the Lark cards: on, switched off, or paused for the month's quota."""
+    from datetime import datetime
+
+    from .schedule import BEIJING
+
+    if not state['on']:
+        return '已停发，快照只存本地给看板用'
+    if state['paused_until']:
+        until = datetime.fromtimestamp(state['paused_until'], BEIJING).strftime('%m-%d %H:%M')
+        return f'飞书本月额度已用完，暂停到 {until} 自动恢复（看板照常更新）'
+    return '照常发送'
+
+
 def cmd_cards(args) -> int:
     from . import registry
-    from .lark.publisher import cards_off, set_cards
+    from .lark.publisher import cards_state, set_cards
 
     folder = (Path(args.registry) if args.registry else registry.default_path()).parent
     if args.state != 'status':
         set_cards(args.state == 'on', folder)
-    off = cards_off(folder)
-    print('飞书卡片：' + ('已停发，快照只存本地给看板用' if off else '照常发送'))
+    print('飞书卡片：' + cards_text(cards_state(folder)))
     if args.state != 'status':
         print('各项目的调度进程几秒内生效，不用重启。')
     return 0
@@ -427,8 +440,8 @@ def cmd_register(args) -> int:
         print(why, file=sys.stderr)
         return 3
     if not Path(project.lark_config).is_file():
-        print('私有目录里缺少飞书配置，卡片发不出去', file=sys.stderr)
-        return 3
+        # The web board shows every project; a Lark card needs the bot config too.
+        print('私有目录里没有飞书配置 lark_app.json：这个项目只在看板上显示，不发飞书卡片')
     entry = registry.entry_for(project, python=args.python, enabled=not args.disable)
     try:
         registry.upsert(args.registry, entry)
@@ -512,9 +525,9 @@ def cmd_projects(args) -> int:
         lines.append('  ' + '　'.join(str(part) for part in parts))
     if running and status.get('helper_error'):
         lines.append(f"  {status['helper_error']}")
-    from .lark.publisher import cards_off
+    from .lark.publisher import cards_state
 
-    lines.append('飞书卡片：' + ('已停发（只存看板）' if cards_off(path.parent) else '照常发送'))
+    lines.append('飞书卡片：' + cards_text(cards_state(path.parent)))
     print('\n'.join(lines))
     return 0
 
@@ -548,7 +561,7 @@ def build_parser() -> argparse.ArgumentParser:
     board.add_argument('--dev', action='store_true', help='本机预览：不登录，只在 127.0.0.1 上')
     board.set_defaults(func=cmd_dashboard)
 
-    cards = sub.add_parser('cards', help='飞书卡片总开关：off 只存本地给看板用，on 恢复发送')
+    cards = sub.add_parser('cards', help='飞书卡片总开关：off 只存本地给看板用，on 恢复发送（也解除额度暂停）')
     cards.add_argument('state', choices=('on', 'off', 'status'))
     cards.add_argument('--registry', type=Path, help='项目登记表（默认同 console）')
     cards.set_defaults(func=cmd_cards)

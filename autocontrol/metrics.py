@@ -218,7 +218,7 @@ class MetricsStore:
             'p95_duration_ratio': overall['p95_duration_ratio'],
             'unconfirmed_action_rate': overall['unconfirmed_action_rate'],
             'delivery_success_rate': (
-                round(sum(row['delivery_status'] in ('sent', 'unchanged', 'stale_ignored', 'local') for row in delivered)
+                round(sum(row['delivery_status'] in ('sent', 'unchanged', 'stale_ignored', 'local', 'quota_paused') for row in delivered)
                       / len(delivered), 4) if delivered else None
             ),  # fmt: skip
             'consecutive_failed_rounds': streak,

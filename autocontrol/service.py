@@ -4,9 +4,9 @@ On start the service runs a live catch-up round, so a window that opened while
 the machine was off is not postponed. Started with ``observe_first`` it reads
 the plan first instead; with ``resume`` (only the console code changed) it
 reads nothing and waits for its next wake. Afterwards it wakes at the next
-fixed time or server-observed candidate; a server time that passed while
-later phases of the round still ran is run right after it (a catch-up
-round never starts another one). The service-day reset wakes for
+fixed time or server-observed candidate; a server time, or a phase's own
+slot time, that passed while the round still ran is run right after it (a
+catch-up round never starts another one). The service-day reset wakes for
 read-only discovery, unless a round follows soon: then the new day's card is
 drawn from the manifest and that round reads the server. Failures back off
 instead of hammering the game server. ``log`` gets one line per decision (the
@@ -92,10 +92,34 @@ def _late(plan, now, runner):
         return None
 
 
+def _missed(plan, began, now, runner) -> tuple:
+    """Slotted phases whose slot time passed during the round that just ended.
+
+    ``()`` when there are none, or when another wake is due within SAME_TIME
+    anyway (that round runs them).
+    """
+    missed = getattr(runner, 'missed_slots', None)
+    if missed is None:
+        return ()
+    try:
+        phases = tuple(missed(began, now))
+        if not phases:
+            return ()
+        due, _ = plan.next_wake(now, runner.dynamic_candidates)
+        if due - now <= SAME_TIME:
+            return ()
+        return phases
+    except Exception:
+        return ()
+
+
+CARD_TEXT = {'local': '只存看板', 'quota_paused': '暂停（飞书额度用完，下月恢复）'}
+
+
 def _outcome(result, seconds) -> str:
     delivery = result.get('delivery') if type(result.get('delivery')) is dict else {}
     status = delivery.get('status', '—')
-    card = '只存看板' if status == 'local' else status
+    card = CARD_TEXT.get(status, status)
     return (
         f"状态 {result.get('status')}，退出码 {result.get('code')}，"
         f"{result.get('phases', 0)} 个阶段，卡片 {card}，用时 {int(seconds)} 秒"
@@ -202,6 +226,14 @@ def run_service(
             scheduled, reset, observe, catching_up = late, False, False, True
             why = f'补跑服务器时刻 {_hm(late)}'
             log(f'下一轮 马上（服务器时刻 {_hm(late)} 在这一轮里已过）')
+            continue
+        missed = () if catching_up else _missed(plan, began, clock(), runner)
+        if missed:
+            # A phase's slot time passed while the round ran: run it now, once
+            # (the wake is no fixed or server time, so only owed slots run).
+            scheduled, reset, observe, catching_up = clock(), False, False, True
+            why = f"补跑阶段时刻（{'、'.join(missed)}）"
+            log(f"下一轮 马上（{'、'.join(missed)} 的阶段时刻在这一轮里已过）")
             continue
         catching_up = False
         due, observe = plan.next_wake(clock(), runner.dynamic_candidates)

@@ -251,6 +251,29 @@ class RoundRunner:
         for phase, started in starts:
             view.mark_slot(phase, started)
 
+    def missed_slots(self, since, now=None) -> tuple[str, ...]:
+        """Slotted phases whose slot time passed while the last round ran, still unrun.
+
+        The service runs them right after the round (see service._missed),
+        instead of leaving them to the next wake, which may be hours away.
+        """
+        schedule = self.project.schedule
+        now = schedule.local(now) or schedule.now()
+        since = schedule.local(since)
+        if since is None or not schedule.slot_map:
+            return ()
+        view = self._slot_view(now)
+        plan = view.effective_schedule
+        done = view.slot_runs
+        day = plan.service_day(now)
+        missed = {
+            phase
+            for phase in plan.slot_map
+            if any(since + SAME_TIME < stamp <= now for stamp in plan.slot_stamps(phase, day))
+            and plan.slot_due(phase, now, done.get(phase, frozenset()))
+        }
+        return tuple(phase for phase in self.project.phases if phase in missed)
+
     def take_overdue(self) -> tuple[float, ...]:
         """Times the last round's phases reported that passed during it, once.
 

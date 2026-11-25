@@ -25,7 +25,7 @@
 |---|---|
 | `console` | 总控进程：按登记表调度所有项目。已经在运行时直接退出 |
 | `autostart [--disable]` | 配置（或取消）一个 launchd 代理 `local.autocontrol.console`：登录时启动总控，总控崩溃时自动拉起。只此一条，和项目数量无关 |
-| `register [--disable]` | 登记项目，交给总控调度（上线）。协议项目要先通过准入，私有目录里要有飞书配置。`--disable` 登记但暂停调度。总控 30 秒内生效 |
+| `register [--disable]` | 登记项目，交给总控调度（上线）。协议项目要先通过准入；私有目录里没有飞书配置时，这个项目只在看板上显示。`--disable` 登记但暂停调度。总控 30 秒内生效 |
 | `unregister <名称>` | 从登记表移除（下线）。它的调度进程跑完当前这一轮后停止 |
 | `projects [--json]` | 列出登记的项目，以及总控和各项目调度进程的状态 |
 | `check [--static] [--repeat N] [--json]` | 准入检查。协议项目通过后，`register`、`serve`、`once` 才会运行；清单改动后要重新检查，通过后总控在两轮之间自动加载新清单。`--static` 不运行执行器 |
@@ -37,7 +37,7 @@
 | `chats` | 列出机器人所在的群，用来查 `chat_id` |
 | `schema [--out docs/schemas]` | 导出协议 JSON Schema |
 | `dashboard [setup \| status \| allow <open_id> \| deny <open_id> \| webhook [test\|off]]` | 网页看板。不带参数时运行看板服务，平时由总控托管；`setup --url <https 地址> --app <lark_app.json>` 写设置，`allow`/`deny` 管白名单，`webhook` 配置申请提醒用的群机器人（交互输入，不回显）；`--dev` 本机预览，不登录 |
-| `cards on\|off\|status` | 飞书卡片总开关。`off` 时每轮的快照只存本地给看板用，不调飞书接口；`on` 恢复发送。各调度进程几秒内生效 |
+| `cards on\|off\|status` | 飞书卡片总开关。`off` 时每轮的快照只存本地给看板用，不调飞书接口；`on` 恢复发送，也会解除额度暂停。`status` 显示是否因本月额度用完而暂停。各调度进程几秒内生效 |
 
 `--skip-admission` 只用于调试。
 
@@ -46,7 +46,7 @@
 脚本作者只按 [docs/接入规范.md](docs/接入规范.md) 改造；下面是维护者上线的步骤。
 
 1. 按 [docs/接入规范.md](docs/接入规范.md) 改造脚本并写 `autocontrol.json`。Python 脚本把 `sdk/python/autocontrol_worker.py` 复制到脚本旁边使用。完整示例见 [examples/demo_worker/](examples/demo_worker/)。
-2. 在私有目录放 `lark_app.json`：权限 0600，字段为 `app_id`、`app_secret`、`chat_id`（`register` 会检查它）。开着飞书卡片时，卡片发到哪个群要和用户确认，`chats` 列出机器人所在的群。
+2. 要发飞书卡片时，在私有目录放 `lark_app.json`：权限 0600，字段为 `app_id`、`app_secret`、`chat_id`。卡片发到哪个群要和用户确认，`chats` 列出机器人所在的群。不放也能登记，这个项目只在看板上显示。
 3. `check --manifest <清单> --repeat 2`，所有必须项都要通过。
 4. `once --manifest <清单> --observe-only`，在看板上确认这个项目的清单和状态。
 5. `register --manifest <清单>`，总控会在 30 秒内接管，先跑一轮只读；`projects` 查看状态。
@@ -60,6 +60,7 @@
 - **不占飞书额度**：页面只读本机文件（登记表、总控状态、各项目保存的卡片快照、指标库、调度日志），每张卡片都用项目自己的卡片代码渲染，内容和飞书卡片一致。登录只用飞书的「认证及授权」接口（授权页、换 user_access_token、读用户信息），按飞书规则不计入企业每月的 API 调用量。
 - **登录**：飞书网页授权（授权码 + PKCE）。在飞书客户端里打开时可以免确认。只有管理员和白名单里的人能看；还没有管理员时，`setup` 之后 24 小时内第一个登录的人成为管理员。会话 Cookie 有效 14 天，改了设置里的 `secret` 所有人都要重新登录。
 - **申请与审批**：不在白名单的人登录后会记成一条申请（`board_people.json`，0600），同一个人一天最多提醒一次。配置了群机器人（`dashboard webhook`）时，管理员在飞书群里收到带「批准」「拒绝」按钮的卡片；自定义机器人的 webhook 消息不计入飞书 API 调用量。卡片按钮只打开看板的审批页，在页面上再点一下才生效（表单带和会话绑定的校验值）。看板的「成员」页列出待批准的申请和白名单，也能移出某个人；只有管理员能进。拒绝后七天内不再提醒。
+- **和飞书卡片的关系**：看板不依赖飞书。飞书返回「本月 API 调用次数已达上限」（99991403）时，所有项目的卡片一起暂停到下月 1 日 00:05（北京时间）自动恢复，暂停记在 `lark_quota.json`，期间快照照常存给看板；`cards on` 可以提前解除（例如升级了飞书版本）。没有飞书配置或配置有误的项目，快照也照常存给看板。
 - **运行**：总控按 `~/.config/autocontrol/console/dashboard.json`（0600）托管看板进程，只监听 127.0.0.1；退出后由总控拉起，换了总控代码时随总控一起换新代码。设置里写了 `tunnel`（cloudflared 配置文件）时，总控也托管隧道进程，公网经 HTTPS 访问。
 - **接入步骤**：
   1. 准备一个固定的 HTTPS 地址（例如 Cloudflare 隧道），转发到本机看板端口（默认 8790）。
@@ -91,7 +92,7 @@
 | `lark_assets.json` | 机器人已上传的卡片图片（执行中的转圈图标）缓存 |
 | `admission/` | 最近一次准入检查记录 |
 
-总控自己的文件在 `~/.config/autocontrol/console/`（0700）：登记表 `projects.json`、锁 `console.lock`、状态 `status.json`、换代码时的交接文件 `handover.json`（新代码启动时读完即删），看板设置 `dashboard.json`、看板申请记录 `board_people.json`、卡片开关 `cards.json`，以及日志：`logs/console.log` 记总控自己的决定（为什么启动、停止、重启哪个项目，什么时候换代码）；`logs/<名称>.log` 是各项目的调度日志，每行一个决定：启动原因、每一轮为什么开（固定时刻、服务器时刻、阶段时刻、换日、失败后重读）、结果（状态、退出码、卡片送达、用时）和下一轮的时刻，也收调度进程的报错；`logs/dashboard.log` 是看板的访问和登录记录（只记路径，不记查询参数）。
+总控自己的文件在 `~/.config/autocontrol/console/`（0700）：登记表 `projects.json`、锁 `console.lock`、状态 `status.json`、换代码时的交接文件 `handover.json`（新代码启动时读完即删），看板设置 `dashboard.json`、看板申请记录 `board_people.json`、卡片开关 `cards.json`、额度暂停 `lark_quota.json`，以及日志：`logs/console.log` 记总控自己的决定（为什么启动、停止、重启哪个项目，什么时候换代码）；`logs/<名称>.log` 是各项目的调度日志，每行一个决定：启动原因、每一轮为什么开（固定时刻、服务器时刻、阶段时刻、换日、失败后重读）、结果（状态、退出码、卡片送达、用时）和下一轮的时刻，也收调度进程的报错；`logs/dashboard.log` 是看板的访问和登录记录（只记路径，不记查询参数）。
 
 ## 开发
 

@@ -62,7 +62,7 @@ def test_the_entry_for_a_loaded_project(project):
     assert item['workdir'] == str(project.workdir.resolve())
 
 
-def test_register_needs_admission_and_a_card_config(tmp_path):
+def test_register_needs_admission_but_no_card_config(tmp_path, capsys):
     from autocontrol.admission import run_check
     from autocontrol.cli import main
 
@@ -73,9 +73,9 @@ def test_register_needs_admission_and_a_card_config(tmp_path):
     args = ['register', '--manifest', str(manifest), '--registry', str(path)]
     assert main(args) == 3  # not admitted yet
     run_check(manifest)
-    assert main(args) == 3  # no card configuration yet
-    (tmp_path / 'private' / 'lark_app.json').write_text('{}')
+    # Without a bot config the project still runs; it only shows on the web board.
     assert main(args) == 0
+    assert '只在看板上显示' in capsys.readouterr().out
     [item] = registry.load(path)
     assert item['manifest'] == str(manifest.resolve())
     assert item['private'] == str((tmp_path / 'private').resolve())

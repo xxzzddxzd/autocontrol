@@ -61,7 +61,7 @@ class FakeFeishu:
 
 class FakeSource:
     def __init__(self):
-        self.cards = False
+        self.state = {'on': True, 'paused_until': None}
 
     def entries(self):
         return [{'name': 'alpha', 'manifest': '/work/alpha/autocontrol.json', 'private': '/cfg/alpha',
@@ -70,8 +70,8 @@ class FakeSource:
     def console(self):
         return {'running': True, 'projects': {'alpha': {'state': 'running', 'pid': 7}}}
 
-    def cards_local(self):
-        return self.cards
+    def cards(self):
+        return self.state
 
     def board(self, entry, day=None, now=None):
         card = {'config': {'summary': {'content': '下次 21:15 · 3/4'}},
@@ -348,8 +348,12 @@ def test_the_card_switch_note_shows_when_cards_are_off(board):
     app, *_ = board
     cookie = cookie_value(sign_in(app), SESSION_COOKIE)
     assert '飞书卡片已停发' not in request(app, '/', cookies={SESSION_COOKIE: cookie}).body.decode()
-    app.source.cards = True
+    app.source.state = {'on': False, 'paused_until': None}
     assert '飞书卡片已停发' in request(app, '/', cookies={SESSION_COOKIE: cookie}).body.decode()
+    resume = datetime(2026, 12, 1, 0, 5, tzinfo=BEIJING).timestamp()
+    app.source.state = {'on': True, 'paused_until': resume}
+    page = request(app, '/', cookies={SESSION_COOKIE: cookie}).body.decode()
+    assert '额度已用完' in page and '12-01 00:05' in page
 
 
 def test_dev_preview_needs_no_sign_in_and_no_settings(tmp_path):

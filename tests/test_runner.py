@@ -539,3 +539,16 @@ def test_a_new_day_without_a_login_is_a_planned_card_and_leaves_a_running_round_
     finally:
         os.close(held)
     assert len(publisher.snapshots) == 1
+
+
+def test_a_slot_time_that_passed_during_a_long_round_is_reported_missed(project, private):
+    # The 13:15 round ran until 14:14: the 14:00 slot of the cardbook passed meanwhile.
+    morning = SlotMetrics([('cardbook', '2026-11-17T06:01:00+08:00')])
+    ran = RoundRunner(project, Publisher(private), now=NOW, metrics=morning)
+    assert ran.missed_slots(_at('13:15'), _at('14:14')) == ('cardbook',)
+    assert ran.missed_slots(_at('14:20'), _at('14:30')) == ()  # no slot time inside the round
+    assert ran.missed_slots(_at('14:00'), _at('14:10')) == ()  # the round began at the slot
+    covered = SlotMetrics([('cardbook', t) for t in ('2026-11-17T06:01:00+08:00',
+                                                     '2026-11-17T14:05:00+08:00')])  # fmt: skip
+    ran = RoundRunner(project, Publisher(private), now=NOW, metrics=covered)
+    assert ran.missed_slots(_at('13:15'), _at('14:14')) == ()  # this window already ran

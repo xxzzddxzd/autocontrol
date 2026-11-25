@@ -59,11 +59,11 @@ class Source:
         running = not locks.is_free(self.dir / 'console.lock')
         return {'running': running, **(status if isinstance(status, dict) else {})}
 
-    def cards_local(self) -> bool:
-        """Whether Lark cards are switched off (snapshots are only saved for the board)."""
-        from ..lark.publisher import cards_off
+    def cards(self) -> dict:
+        """Lark cards: ``{'on': switched on, 'paused_until': quota pause end or None}``."""
+        from ..lark.publisher import cards_state
 
-        return cards_off(self.dir)
+        return cards_state(self.dir)
 
     # -- one project ---------------------------------------------------------------
 

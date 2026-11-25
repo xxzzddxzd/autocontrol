@@ -186,3 +186,36 @@ def test_a_passed_server_time_is_left_to_a_round_that_is_due_soon_anyway():
     # The round ends 13:14 and the 13:15 round is due within two minutes: it runs instead.
     assert [call[1] for call in runner.calls] == [start, start.replace(minute=15)]
     assert runner.phases[1] == ('due-at', start.replace(minute=15))
+
+
+class SlotRunner(Runner):
+    """Each round takes ``minutes``; ``missed`` lists, per round, the slotted
+    phases whose slot time passed during it."""
+
+    def __init__(self, clock, missed, minutes):
+        super().__init__([])
+        self.clock, self.missed, self.minutes, self.since = clock, list(missed), minutes, []
+
+    def run_once(self, *, observe_only, now, phases=None):
+        result = super().run_once(observe_only=observe_only, now=now, phases=phases)
+        self.clock.now += timedelta(minutes=self.minutes)
+        return result
+
+    def missed_slots(self, since, now=None):
+        self.since.append(since)
+        return tuple(self.missed.pop(0)) if self.missed else ()
+
+
+def test_a_slot_time_that_passed_during_the_round_runs_right_after_it_once():
+    start = datetime(2026, 11, 17, 13, 15, tzinfo=BEIJING)
+    clock = Clock(start)
+    runner = SlotRunner(clock, [('cardbook',), ('cardbook',)], minutes=59)
+    lines = []
+    run_service(runner, stop=Stop(clock, runner, 3), clock=clock, log=lines.append)
+    after = start + timedelta(minutes=59)
+    # The 14:00 slot passed while the 13:15 round ran: the cardbook runs at 14:14,
+    # once; the catch-up round's own miss starts nothing, so 21:15 is next.
+    assert [call[1] for call in runner.calls] == [start, after, start.replace(hour=21)]
+    assert runner.phases[1] == ('due-at', after)
+    assert '下一轮 马上（cardbook 的阶段时刻在这一轮里已过）' in lines
+    assert any(line.startswith('开始一轮：补跑阶段时刻（cardbook）') for line in lines)

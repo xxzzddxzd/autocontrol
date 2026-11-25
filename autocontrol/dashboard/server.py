@@ -438,8 +438,14 @@ class App:
         nonce = secrets.token_urlsafe(16)
         note = ''
         try:
-            if self.source.cards_local():
+            cards = self.source.cards()
+            if not cards['on']:
                 note = '<div class="note">飞书卡片已停发，进度只在这里更新。</div>'
+            elif cards['paused_until']:
+                until = datetime.fromtimestamp(cards['paused_until'], self.tz).strftime(
+                    '%m-%d %H:%M'
+                )
+                note = f'<div class="note">飞书本月额度已用完，卡片暂停到 {until} 自动恢复；' '这里照常更新。</div>'
         except Exception:
             pass
         html = pages.page(title, main, nonce=nonce, stamp=stamp, console=console, user=user['name'],

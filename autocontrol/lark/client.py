@@ -24,6 +24,16 @@ MAX_IMAGE_BYTES = 10 * 1024 * 1024
 TOKEN_ERRORS = frozenset({99991661, 99991663, 99991664, 99991668})
 PERMISSION_ERRORS = frozenset({99991672, 99991676, 99991679, 230027})
 RATE_LIMIT_ERRORS = frozenset({230020})
+# The tenant's monthly API quota is used up: nothing helps until the 1st.
+QUOTA_ERRORS = frozenset({99991403})
+
+
+def _api_code(raw) -> int | None:
+    try:
+        code = json.loads(raw).get('code')
+    except (ValueError, UnicodeDecodeError, AttributeError):
+        return None
+    return code if type(code) is int else None
 
 
 class DeliveryError(Exception):
@@ -99,7 +109,10 @@ def request_json(method, url, headers, body, timeout) -> dict:
         finally:
             exc.close()
         if exc.code == 429:
-            raise DeliveryError('rate_limited') from None
+            code = _api_code(raw)
+            if code in QUOTA_ERRORS:
+                raise DeliveryError('quota_exhausted', api_code=code) from None
+            raise DeliveryError('rate_limited', api_code=code) from None
         if exc.code >= 500:
             raise DeliveryError('server_error', uncertain=write) from None
         try:
@@ -182,6 +195,8 @@ class FeishuClient:
                 category = 'permission_denied'
             elif code in RATE_LIMIT_ERRORS:
                 category = 'rate_limited'
+            elif code in QUOTA_ERRORS:
+                category = 'quota_exhausted'
             else:
                 category = 'api_error'
             raise DeliveryError(category, api_code=code)

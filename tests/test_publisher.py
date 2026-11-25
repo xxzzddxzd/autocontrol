@@ -571,3 +571,101 @@ def test_publisher_renders_with_the_uploaded_spinner_or_without_it(private):
     assert sender.submit(snapshot())
     assert sender.close()
     assert seen == [None] and failing.sent  # the card still goes out, with the static icon
+
+
+# -- the tenant's monthly quota ---------------------------------------------------------
+
+
+def test_next_month_is_just_after_midnight_on_the_first_in_beijing():
+    from datetime import datetime
+
+    from autocontrol.lark.publisher import next_month
+    from autocontrol.schedule import BEIJING
+
+    def at(*parts):
+        return datetime(*parts, tzinfo=BEIJING).timestamp()
+
+    assert next_month(at(2026, 11, 25, 19, 0)) == at(2026, 12, 1, 0, 5)
+    assert next_month(at(2026, 12, 31, 23, 59)) == at(2027, 1, 1, 0, 5)
+
+
+def test_a_used_up_quota_pauses_every_card_until_next_month(private, tmp_path):
+    from autocontrol.lark.publisher import cards_state, cards_switch_path, next_month, set_cards
+
+    console = tmp_path / 'console'
+
+    class Exhausted(FakeClient):
+        calls = 0
+
+        def send_card(self, chat_id, card, uuid):
+            Exhausted.calls += 1
+            raise DeliveryError('quota_exhausted', api_code=99991403)
+
+    write_config(private)
+    card = publisher(private, Exhausted(), switch_path=cards_switch_path(console))
+    try:
+        assert card.submit(snapshot(1)) and card.flush(5)
+        assert card.status['status'] == 'quota_paused' and card.delivered
+        state = cards_state(console)
+        assert state['on'] and abs(state['paused_until'] - next_month()) < 5
+        assert card.submit(snapshot(2)) and card.flush(5)
+        assert Exhausted.calls == 1  # paused: no more calls this month
+        row = store(private).get('yslzm', '2026-11-17', 'oc_test')
+        assert (
+            row['delivery_status'] == 'quota_paused' and row['snapshot']['tasks'][0]['current'] == 2
+        )
+    finally:
+        card.close()
+    # A second scheduler sees the shared pause and does not call Feishu either.
+    other = publisher(private, Exhausted(), switch_path=cards_switch_path(console))
+    try:
+        assert other.submit(snapshot(3)) and other.flush(5)
+        assert Exhausted.calls == 1 and other.status['status'] == 'quota_paused'
+    finally:
+        other.close()
+    # The 1st has come (or someone switched cards on): the newest display goes out.
+    set_cards(True, console)
+    assert cards_state(console)['paused_until'] is None
+    client = FakeClient()
+    resumed = publisher(private, client, switch_path=cards_switch_path(console))
+    try:
+        assert resumed.submit(snapshot(4)) and resumed.flush(5)
+        assert resumed.status['status'] == 'sent' and client.sent
+    finally:
+        resumed.close()
+
+
+def test_without_a_bot_the_board_still_gets_every_display(private):
+    card = publisher(private, FakeClient())
+    try:
+        assert card.submit(snapshot(5))
+        card.flush(1)
+        assert card.status['status'] == 'local' and card.status['error_code'] == 'config_missing'
+    finally:
+        card.close()
+    row = store(private).get('yslzm', '2026-11-17', 'local')
+    assert row['snapshot']['tasks'][0]['current'] == 5
+
+
+def test_http_429_tells_a_used_up_quota_from_a_rate_limit(monkeypatch):
+    import io
+    from urllib import error
+
+    from autocontrol.lark import client as lark_client
+
+    def opener_for(body):
+        class Opener:
+            def open(self, req, timeout):
+                raise error.HTTPError(req.full_url, 429, 'Too Many Requests', {}, io.BytesIO(body))
+
+        return lambda *handlers: Opener()
+
+    monkeypatch.setattr(lark_client.request, 'build_opener',
+                        opener_for(b'{"code":99991403,"msg":"quota exceeded"}'))  # fmt: skip
+    with pytest.raises(DeliveryError) as raised:
+        lark_client.request_json('POST', 'https://open.feishu.cn/x', {}, {}, 5)
+    assert (raised.value.code, raised.value.api_code) == ('quota_exhausted', 99991403)
+    monkeypatch.setattr(lark_client.request, 'build_opener', opener_for(b'{"code":99991400}'))
+    with pytest.raises(DeliveryError) as raised:
+        lark_client.request_json('POST', 'https://open.feishu.cn/x', {}, {}, 5)
+    assert raised.value.code == 'rate_limited'
