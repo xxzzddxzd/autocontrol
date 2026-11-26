@@ -22,11 +22,11 @@ _TEXT_KEYS = frozenset(
         'project', 'service_day', 'timezone', 'reset_at', 'updated_at', 'observed_at',
         'next_check_at', 'next_run_at', 'next_discovery_at', 'status', 'phase', 'task_id',
         'title', 'reason', 'unit', 'availability', 'opens_at', 'ends_at', 'finished_at',
-        'parent_task',
+        'parent_task', 'done_at', 'done_how', 'trouble',
     }
 )  # fmt: skip
 _NUMBER_KEYS = frozenset(
-    {'schema', 'current', 'total', 'generation', 'sequence', 'display_revision'}
+    {'schema', 'current', 'total', 'generation', 'sequence', 'display_revision', 'fail_streak'}
 )
 _BOOL_KEYS = frozenset({'discovered', 'running', 'seen', 'opened'})
 _SUMMARY_KEYS = frozenset(
@@ -103,20 +103,28 @@ def sanitize_snapshot(snapshot, *, count_keys=frozenset(), phases=frozenset()) -
         result['round_phases'] = [
             value for value in order[:16] if isinstance(value, str) and value in phases
         ]
-    runs = snapshot.get('slot_runs')
-    if isinstance(runs, dict):
-        result['slot_runs'] = {
-            phase: sorted(
-                {index for index in indexes[:16] if type(index) is int and 0 <= index < 16}
-            )
-            for phase, indexes in list(runs.items())[:16]
-            if isinstance(phase, str) and phase in phases and isinstance(indexes, list)
-        }
+    for key in ('slot_runs', 'slot_fails'):
+        runs = snapshot.get(key)
+        if isinstance(runs, dict):
+            result[key] = {
+                phase: sorted(
+                    {index for index in indexes[:48] if type(index) is int and 0 <= index < 48}
+                )
+                for phase, indexes in list(runs.items())[:16]
+                if isinstance(phase, str) and phase in phases and isinstance(indexes, list)
+            }
     wakes = snapshot.get('dynamic_candidates')
     if isinstance(wakes, list):
         result['dynamic_candidates'] = [
             value for value in wakes[:48] if isinstance(value, str) and _ISO.fullmatch(value)
         ]
+    owners = snapshot.get('dynamic_owners')
+    if isinstance(owners, dict):
+        result['dynamic_owners'] = {
+            stamp: [name for name in found[:8] if name == '*' or name in phases]
+            for stamp, found in list(owners.items())[:48]
+            if isinstance(stamp, str) and _ISO.fullmatch(stamp) and isinstance(found, list)
+        }
     summary = snapshot.get('summary')
     if isinstance(summary, dict):
         result['summary'] = {k: v for k, v in summary.items() if k in _SUMMARY_KEYS and _number(v)}

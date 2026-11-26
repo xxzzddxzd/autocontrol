@@ -1,7 +1,9 @@
-"""Advisory ``flock`` locks inside a private directory.
+"""Advisory ``flock`` locks.
 
-The file checks match the game worker's own run lock, so the console can probe
-the worker's account lock without logging in or changing game state.
+The console's own locks live in its private directory and are checked
+strictly. Another program's account lock is only probed (``is_free``): the
+console never creates, changes or holds it, so the probe needs no login and
+cannot change game state.
 """
 
 from __future__ import annotations
@@ -61,12 +63,23 @@ def held(path):
 
 
 def is_free(path) -> bool:
-    """Probe a lock someone else may hold; a missing directory means free."""
+    """Probe a lock another program may hold, without creating or changing it.
+
+    Only whether someone holds the flock matters: the file belongs to that
+    program, so its permission bits are its own business. A missing file or
+    directory means free; anything but a regular file is an error.
+    """
     try:
-        fd = acquire(path)
-    except AlreadyRunning:
-        return False
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
     except FileNotFoundError:
         return True
-    os.close(fd)
-    return True
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError('account lock is not a regular file')
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        return True
+    finally:
+        os.close(fd)

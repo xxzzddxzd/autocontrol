@@ -460,3 +460,95 @@ def test_a_server_reported_wake_runs_only_the_activities_phase(project, private)
     near_reset = datetime.fromisoformat('2026-11-18T04:59:59+08:00')
     runner_.dynamic_candidates = (near_reset.timestamp(),)
     assert runner_.phases_for(near_reset, scheduled_at=near_reset) == ()  # quiet: nothing runs
+
+
+class TaskDayMetrics(SlotMetrics):
+    def __init__(self):
+        super().__init__()
+        self.days = []
+
+    def record_task_days(self, project, day, rows, when):
+        self.days.append((day, rows))
+
+
+def test_task_days_carry_the_cards_verdict_and_failure_streaks(project, private):
+    metrics = TaskDayMetrics()
+    runner_ = RoundRunner(project, Publisher(private), now=NOW, metrics=metrics)
+    view = project.new_projection(NOW, restore=False)
+    view.apply_event({'kind': 'task_failed', 'task_id': 'guild', 'reason': 'action_exception'})
+    view.apply_event({'kind': 'task_finished', 'task_id': 'bear', 'status': 'waiting',
+                      'reason': 'quota_cap'})  # fmt: skip
+    view.finish_run(NOW)
+    runner_._record_task_days(view)
+    ((day, rows),) = metrics.days
+    assert rows['guild'] == {'status': 'failed', 'done': 0, 'fail_streak': 1}
+    assert rows['bear'] == {'status': 'waiting', 'done': 1, 'fail_streak': None}
+
+
+class Recorder:
+    def __init__(self):
+        self.snapshots = []
+        self.status = {'status': 'sent'}
+
+    def submit(self, snapshot):
+        self.snapshots.append(snapshot)
+
+    def flush(self, timeout=None):
+        pass
+
+
+def test_resuming_takes_up_the_saved_wakes_and_redraws_the_card_without_a_login(project, private):
+    from datetime import timedelta
+
+    publisher = Recorder()
+    first = RoundRunner(project, publisher, now=NOW)
+    view = project.new_projection(NOW, restore=False)
+    wake = NOW + timedelta(hours=1)
+    view.apply_event(
+        {'kind': 'plan', 'plan': {'goals': {}, 'dynamic_candidates': [wake.timestamp()]}}
+    )
+    view.apply_event({'kind': 'task_finished', 'task_id': 'arena', 'status': 'complete'})
+    first._publish(view)
+    saved = publisher.snapshots[-1]
+
+    def previous(self, day):
+        return saved if day == saved['service_day'] else None
+
+    later = RoundRunner(project, Recorder(), now=NOW)
+    with patch.object(type(project), 'previous_display', previous):
+        assert later.resume(NOW + timedelta(minutes=10)) is True
+    assert later.dynamic_candidates == (wake.timestamp(),)
+    drawn = later.publisher.snapshots[-1]
+    assert drawn['discovered'] is True
+    assert next(row for row in drawn['tasks'] if row['task_id'] == 'arena')['status'] == 'complete'
+
+
+def test_a_new_day_without_a_login_is_a_planned_card_and_leaves_a_running_round_alone(
+    project, private
+):
+    publisher = Recorder()
+    runner_ = RoundRunner(project, publisher, now=NOW)
+    reset = datetime.fromisoformat('2026-11-18T05:00:05+08:00')
+    assert runner_.start_day(reset) is True
+    card = publisher.snapshots[-1]
+    assert card['service_day'] == '2026-11-18' and card['discovered'] is True
+    assert all(row['status'] == 'not_started' for row in card['tasks'])
+    held = locks.acquire(project.round_lock)
+    try:
+        assert runner_.start_day(reset) is False  # the running round draws it
+    finally:
+        os.close(held)
+    assert len(publisher.snapshots) == 1
+
+
+def test_a_slot_time_that_passed_during_a_long_round_is_reported_missed(project, private):
+    # The 13:15 round ran until 14:14: the 14:00 slot of the cardbook passed meanwhile.
+    morning = SlotMetrics([('cardbook', '2026-11-17T06:01:00+08:00')])
+    ran = RoundRunner(project, Publisher(private), now=NOW, metrics=morning)
+    assert ran.missed_slots(_at('13:15'), _at('14:14')) == ('cardbook',)
+    assert ran.missed_slots(_at('14:20'), _at('14:30')) == ()  # no slot time inside the round
+    assert ran.missed_slots(_at('14:00'), _at('14:10')) == ()  # the round began at the slot
+    covered = SlotMetrics([('cardbook', t) for t in ('2026-11-17T06:01:00+08:00',
+                                                     '2026-11-17T14:05:00+08:00')])  # fmt: skip
+    ran = RoundRunner(project, Publisher(private), now=NOW, metrics=covered)
+    assert ran.missed_slots(_at('13:15'), _at('14:14')) == ()  # this window already ran

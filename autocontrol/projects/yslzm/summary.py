@@ -992,6 +992,9 @@ PHASE_STATES = (
             'not_executed',
             'outside_draw_window',
             'needs_craft',
+            # summarize_bear: score below the cheapest cake / trades still open.
+            'insufficient_resources',
+            'available',
         )
     )
 )

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta, timezone, tzinfo
 import math
 
@@ -27,6 +27,17 @@ class Schedule:
     also a fixed time joins that full round) and is left out of every other
     wake. Each slot opens a window that lasts until the next slot or the day
     reset; a window without a successful run is caught up at the next wake.
+    ``slot_until`` gives a slotted phase a deadline per slot (e.g. a boat race
+    open 18:45-18:57): past it, a window without a successful run is missed
+    and never caught up.
+
+    ``wake_phases`` lists slotted phases that also run at the server times
+    they report themselves (e.g. a workshop that finishes before its next
+    slot); a wake owned only by such phases runs only them.
+
+    ``idle`` gives a slotted phase fewer times while its work is out (e.g.
+    no materials left): ``(('commander', 'insufficient_materials', ('06:00',
+    '14:00', '22:00')),)``. :meth:`with_idle` is the schedule in that state.
     """
 
     times: tuple[str, ...]
@@ -34,8 +45,15 @@ class Schedule:
     tz: tzinfo = BEIJING
     tz_name: str = 'Asia/Shanghai'
     slots: tuple = ()
+    # ((phase, ('18:57', ...)), ...): one deadline per slot time, in the order
+    # the phase lists its times.
+    slot_until: tuple = ()
     # Phases a server-reported time wakes (None: every phase without slots).
     dynamic_phases: tuple | None = None
+    wake_phases: tuple = ()
+    # ((phase, reason, ('06:00', ...)), ...): the times a slotted phase keeps
+    # while a task of its section reports blocked with that reason.
+    idle: tuple = ()
 
     def __post_init__(self):
         if not self.times:
@@ -50,10 +68,44 @@ class Schedule:
                 raise ValueError('slots must be distinct clock times')
             for value in texts:
                 _clock(value)
+        if set(self.wake_phases) - set(phases):
+            raise ValueError('wake_phases must be slotted phases')
+        listed = dict(self.slots)
+        for phase, deadlines in self.slot_until:
+            texts = listed.get(phase)
+            if texts is None or len(deadlines) != len(texts):
+                raise ValueError('until needs one deadline per slot time')
+            for start, deadline in zip(texts, deadlines):
+                if _clock(deadline) == _clock(start):
+                    raise ValueError('a slot deadline must differ from its slot time')
+        idle = [phase for phase, _, _ in self.idle]
+        if len(idle) != len(set(idle)) or set(idle) - set(listed):
+            raise ValueError('idle times belong to one slotted phase each')
+        for _, reason, texts in self.idle:
+            if type(reason) is not str or not reason or not texts or len(set(texts)) != len(texts):
+                raise ValueError('idle needs a reason and distinct clock times')
+            for value in texts:
+                _clock(value)
 
     @property
     def slot_map(self) -> dict[str, tuple[str, ...]]:
         return {phase: tuple(texts) for phase, texts in self.slots}
+
+    @property
+    def idle_reasons(self) -> dict[str, str]:
+        """``{phase: reason}`` of the slotted phases that have idle times."""
+        return {phase: reason for phase, reason, _ in self.idle}
+
+    def with_idle(self, phases) -> Schedule:
+        """This schedule with ``phases`` on their idle times (no deadlines meanwhile)."""
+        times = {phase: tuple(texts) for phase, _, texts in self.idle if phase in phases}
+        if not times:
+            return self
+        return replace(
+            self,
+            slots=tuple((phase, times.get(phase, texts)) for phase, texts in self.slots),
+            slot_until=tuple(item for item in self.slot_until if item[0] not in times),
+        )
 
     def now(self) -> datetime:
         return datetime.now(self.tz)
@@ -135,6 +187,31 @@ class Schedule:
             if current >= stamp - SAME_TIME:
                 index = position
         return index
+
+    def slot_deadline(self, phase: str, day: str, index: int) -> datetime | None:
+        """When the ``index``-th slot window of the day stops being caught up (None: never)."""
+        deadlines = dict(self.slot_until).get(phase)
+        if deadlines is None:
+            return None
+        pairs = sorted(
+            (self.on_day(day, text), text, deadline)
+            for text, deadline in zip(self.slot_map.get(phase, ()), deadlines)
+        )
+        if not 0 <= index < len(pairs):
+            return None
+        start, text, deadline = pairs[index]
+        (hour, minute), (until_hour, until_minute) = _clock(text), _clock(deadline)
+        minutes = (until_hour * 60 + until_minute - hour * 60 - minute) % (24 * 60)
+        return start + timedelta(minutes=minutes)
+
+    def slot_due(self, phase: str, when, done=frozenset()) -> bool:
+        """The current slot window still needs a successful run and can still get one."""
+        current = self._require(when)
+        window = self.slot_window(phase, current)
+        if window is None or window in done:
+            return False
+        deadline = self.slot_deadline(phase, self.service_day(current), window)
+        return deadline is None or current <= deadline
 
     def is_slot(self, phase: str, when) -> bool:
         current = self._require(when)

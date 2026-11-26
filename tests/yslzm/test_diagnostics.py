@@ -235,3 +235,143 @@ class ActivityDiagnosticsTests(unittest.TestCase):
         self.assertEqual(
             [row['reason'] for row in bounded], ['bear_store_' + reason for _, reason in pairs]
         )
+
+    def test_craft_debit_diagnostics_keep_only_bounded_numbers(self):
+        source = {
+            'policy_jobs': {
+                'heart_crafting': [
+                    {
+                        'kind': 'fashion_extension',
+                        'status': 'uncertain',
+                        'operation': 8,
+                        'target_id': 35224,
+                        'index': 13,
+                        'reason': 'craft_material_debit_missing',
+                        'missing_proof': ['material_debit'],
+                        'error_type': 'TimeoutError',
+                        'failure_stage': 'craft',
+                        'action_sent_actions': 1,
+                        'material_deltas': [
+                            [1, 853, -13, 0],
+                            [1, 6999, -30, None],
+                            [2, 5, -1, 0],
+                            [1, 8, -1, 10**9],
+                            [1, 9, -1, 0],
+                        ],
+                        'observed_commands': [
+                            [577, 1],
+                            [733, 1],
+                            [0, 3],
+                            [70000, 1],
+                            [610, 0],
+                            [PRIVATE_MARKER, 1],
+                            [41, True],
+                        ],
+                    }
+                ]
+            }
+        }
+        issues = extract_diagnostics(source)['action_issues']
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0]['material_deltas'], ((1, 853, -13, 0), (1, 6999, -30, None)))
+        self.assertEqual(issues[0]['observed_commands'], ((577, 1), (733, 1)))
+        self.assertNotIn(PRIVATE_MARKER, json.dumps(issues))
+        # A saved result read back as JSON keeps the same bounded tuples.
+        self.assertEqual(sanitize_issues(json.loads(json.dumps(issues))), issues)
+        # A one-copy wardrobe material is expected to change by 0.
+        row = dict(issues[0], material_deltas=[[1, 10, 0, -1]])
+        self.assertEqual(sanitize_issues([row])[0]['material_deltas'], ((1, 10, 0, -1),))
+
+    def test_shop_and_first_clear_proof_numbers_survive_the_adapter_allowlist(self):
+        # 2026-11-22 06:00: the daily welfare box (delta mismatch) and a first
+        # clear (12 s step deadline) failed and these numbers were dropped.
+        shop = {
+            'kind': 'shop_purchase',
+            'name': '每日福利礼盒',
+            'sku': 613,
+            'item': 6249,
+            'limit': 15992,
+            'status': 'uncertain',
+            'failure_stage': 'shop_resources',
+            'reason': 'shop_resource_delta_mismatch',
+            'error_type': 'TimeoutError',
+            'action_sent_actions': 1,
+            'diagnostics': {
+                'resources': [
+                    {
+                        'kind': 'dye',
+                        'counter': 1576,
+                        'before': 9999,
+                        'after': 9999,
+                        'delta': 0,
+                        'expected_delta': 5,
+                    },
+                    {
+                        'kind': 'gold',
+                        'counter': 0,
+                        'before': 120000,
+                        'after': 120882,
+                        'delta': 882,
+                        'expected_delta': 882,
+                    },
+                    {
+                        'kind': PRIVATE_MARKER,
+                        'counter': 1,
+                        'before': 0,
+                        'after': 0,
+                        'delta': 0,
+                        'expected_delta': 1,
+                    },
+                ],
+                'quota_before': 0,
+                'quota_after': 1,
+                'quota_expected': 1,
+                'shopping_result': {'code': 0, 'cart_results': [{'cart_index': 0, 'code': 0}]},
+                'commands': [
+                    {'command': 338, 'count': 1},
+                    {'command': 32, 'count': 1},
+                    {'command': PRIVATE_MARKER, 'count': 1},
+                ],
+                'errors': [],
+                'token': PRIVATE_MARKER,
+            },
+        }
+        first = {
+            'kind': 'stage_first_clear',
+            'status': 'uncertain',
+            'error_type': 'TimeoutError',
+            'diagnostics': {
+                'stage_id': 10203,
+                'sent_commands': [703, 747, 748],
+                'entry_error_codes': [0],
+                'legacy_start_error_codes': [],
+                'combat_start_observations': [{'combat_type': 1, 'error_code': 0}],
+                'all_received_command_counts': {'703': 1, '747': 1, '561': 2, PRIVATE_MARKER: 4},
+                'native_errors': [{'kind': 1, 'show': 1, 'code': 4012}],
+                'story_skip_gates': {'token': PRIVATE_MARKER},
+            },
+        }
+        issues = extract_diagnostics(
+            {'shop_purchase_actions': [shop], 'stage_first_clear_actions': [first]}
+        )['action_issues']
+        saved = {row['feature']: row for row in issues}
+        purchase = saved['shop_purchases']
+        self.assertEqual(
+            purchase['resource_deltas'], (('dye', 1576, 5, 0, 9999), ('gold', 0, 882, 882, 120000))
+        )
+        self.assertEqual(purchase['quota_counts'], (0, 1, 1))
+        self.assertEqual(purchase['receipt_codes'], (0, 0))
+        self.assertEqual(purchase['observed_commands'], ((32, 1), (338, 1)))
+        clear = saved['stage_first_clears']
+        self.assertEqual((clear['stage_id'], clear['sent_commands']), (10203, (703, 747, 748)))
+        self.assertEqual(clear['response_codes'], ((703, 0), (747, 0)))
+        self.assertEqual(clear['observed_commands'], ((561, 2), (703, 1), (747, 1)))
+        self.assertEqual(clear['native_errors'], ((1, 1, 4012),))
+        self.assertNotIn(PRIVATE_MARKER, json.dumps(issues))
+        # The worker's saved rows pass the adapter unchanged, also after JSON.
+        self.assertEqual(sanitize_issues(json.loads(json.dumps(issues))), issues)
+        # Other kinds never borrow these fields from a free-form dict.
+        other = extract_diagnostics(
+            {'mail_actions': [{'status': 'uncertain', 'diagnostics': shop['diagnostics']}]}
+        )
+        self.assertNotIn('resource_deltas', json.dumps(other))

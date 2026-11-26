@@ -67,7 +67,9 @@ class Worker:
         self.protocol = env.get('AUTOCONTROL_PROTOCOL')
         self.project = env.get('AUTOCONTROL_PROJECT', '')
         self.phase = env.get('AUTOCONTROL_PHASE', sys.argv[1] if len(sys.argv) > 1 else 'manual')
-        self.mode = env.get('AUTOCONTROL_MODE', 'execute')
+        # Run by hand (no console environment), a script only reads: executing
+        # needs AUTOCONTROL_MODE=execute, which the console always sets.
+        self.mode = env.get('AUTOCONTROL_MODE', 'observe')
         self.observe = self.mode == 'observe'
         self.service_day = env.get('AUTOCONTROL_SERVICE_DAY') or time.strftime('%Y-%m-%d')
         self.run_id = env.get('AUTOCONTROL_RUN_ID') or uuid.uuid4().hex

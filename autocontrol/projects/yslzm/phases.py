@@ -80,7 +80,10 @@ def command_line(command, target_day, *, python=None) -> list[str]:
     ]  # fmt: skip
 
 
-def run_child(project, command, target_day, timeout, *, run_scope=None, on_event=None, python=None):
+def run_child(
+    project, command, target_day, timeout, *, run_scope=None, on_event=None, python=None,
+    on_stderr=None,
+):  # fmt: skip
     try:
         if not stat.S_ISDIR(Path(project).stat().st_mode):
             raise NotADirectoryError()
@@ -106,7 +109,7 @@ def run_child(project, command, target_day, timeout, *, run_scope=None, on_event
         else:
             child = run_streamed(
                 argv, cwd=project, on_event=on_event, progress_env=PROGRESS_ENV,
-                timeout=timeout, **options,
+                timeout=timeout, on_stderr=on_stderr, **options,
             )  # fmt: skip
     except subprocess.TimeoutExpired as error:
         partial = latest_summary(error.stdout) if error.stdout is not None else None
@@ -139,8 +142,9 @@ def run_scheduled(
     started = datetime.now(BEIJING)
     options = {'on_event': on_event} if on_event is not None else {}
     outcome = run_child(
-        project, command, target_day, timeout, run_scope=run_scope, python=python, **options
-    )
+        project, command, target_day, timeout, run_scope=run_scope, python=python,
+        on_stderr=lambda data: storage.keep_stderr(private, started, command, data), **options,
+    )  # fmt: skip
     record = {
         'command': command,
         'civil_date': started.date().isoformat(),
@@ -220,6 +224,7 @@ def run_round(
         options['input'] = payload
     reported = []
     state = {'started': datetime.now(BEIJING), 'lines': 0}
+    round_started = state['started']
 
     def finish(outcome) -> None:
         command = commands[len(reported)]
@@ -260,7 +265,9 @@ def run_round(
         child = run_streamed(
             argv, cwd=project, on_event=on_event or (lambda event: None),
             progress_env=PROGRESS_ENV, timeout=timeout, on_line=line,
-            restart_timeout_on_line=True, **options,
+            restart_timeout_on_line=True,
+            on_stderr=lambda data: storage.keep_stderr(private, round_started, 'round', data),
+            **options,
         )  # fmt: skip
     except subprocess.TimeoutExpired:
         if len(reported) < len(commands):

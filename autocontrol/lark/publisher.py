@@ -9,13 +9,24 @@ failure only the newest snapshot of each day is retried, with backoff.
 Card identity is made idempotent with a stable per-day UUID: an uncertain
 create is resolved from chat history or the same UUID inside the server's
 one-hour idempotency window, never by sending a second card.
+
+The console-wide switch ``cards.json`` (``{"lark": false}``) turns Lark cards
+off: each snapshot is then only saved locally for the web board, and no Feishu
+API is called. Turning it back on brings every remembered day to its card.
+
+When Feishu says the tenant's monthly API quota is used up (99991403), cards
+pause until shortly after the 1st of next month (Beijing time). The pause is
+shared through ``lark_quota.json`` next to the switch, so every project stops
+at once. Meanwhile snapshots are saved for the board as usual. A project
+without a bot config, or with a broken one, still saves its snapshots: the
+web board never depends on Lark.
 """
 
 from __future__ import annotations
 
 from collections import OrderedDict
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 import fcntl
 import hashlib
 import json
@@ -26,11 +37,102 @@ import threading
 import time
 import uuid
 
+from . import assets
 from .client import DeliveryError, FeishuClient, load_config
 from .store import BoardStore
 
 UUID_WINDOW_SECONDS = 3500
-SUCCESS = frozenset({'sent', 'unchanged', 'stale_ignored'})
+SUCCESS = frozenset({'sent', 'unchanged', 'stale_ignored', 'local', 'quota_paused'})
+CARDS_FILE = 'cards.json'
+QUOTA_FILE = 'lark_quota.json'
+QUOTA_RESUME = 300  # resume this many seconds after midnight on the 1st (Beijing)
+NO_BOT = frozenset({'config_missing', 'chat_id_missing'})  # board only, by design
+
+
+def next_month(now=None) -> float:
+    """Shortly after 00:00 on the 1st of next month, Beijing time (the quota refresh)."""
+    from ..schedule import BEIJING
+
+    current = datetime.fromtimestamp(time.time() if now is None else now, BEIJING)
+    first = (current.replace(day=1) + timedelta(days=32)).replace(
+        day=1, hour=0, minute=0, second=0, microsecond=0
+    )
+    return first.timestamp() + QUOTA_RESUME
+
+
+def _read_pause(path) -> float | None:
+    try:
+        with open(path, 'rb') as source:
+            data = json.loads(source.read(4096))
+    except (OSError, ValueError):
+        return None
+    until = data.get('paused_until') if isinstance(data, dict) else None
+    return float(until) if type(until) in (int, float) else None
+
+
+def _write_pause(path, until: float) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    temporary = path.with_name(f'.{path.name}.{os.getpid()}.tmp')
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'w', encoding='utf-8') as output:
+        json.dump(
+            {'paused_until': until, 'since': time.time(), 'reason': 'quota_exhausted'}, output
+        )
+        output.write('\n')
+    os.replace(temporary, path)
+
+
+def cards_state(console_dir=None, now=None) -> dict:
+    """``{'on': bool, 'paused_until': epoch or None}`` for status lines and the board."""
+    switch = cards_switch_path(console_dir)
+    until = _read_pause(switch.with_name(QUOTA_FILE))
+    now = time.time() if now is None else now
+    return {'on': not _switch_off(switch), 'paused_until': until if until and until > now else None}
+
+
+def cards_switch_path(console_dir=None) -> Path:
+    """The console-wide card switch, next to the project list."""
+    if console_dir is None:
+        from .. import registry
+
+        console_dir = registry.default_path().parent
+    return Path(console_dir) / CARDS_FILE
+
+
+def _switch_off(path) -> bool:
+    try:
+        with open(path, 'rb') as source:
+            data = json.loads(source.read(4096))
+    except (OSError, ValueError):
+        return False
+    return isinstance(data, dict) and data.get('lark') is False
+
+
+def cards_off(console_dir=None) -> bool:
+    """True when Lark cards are switched off and snapshots only feed the web board."""
+    return _switch_off(cards_switch_path(console_dir))
+
+
+def set_cards(on: bool, console_dir=None) -> Path:
+    """Switch Lark cards on or off for every project; schedulers notice within seconds.
+
+    Switching on also lifts a quota pause (e.g. after a plan upgrade); if the
+    quota is still used up, the first card attempt pauses them again.
+    """
+    path = cards_switch_path(console_dir)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if on:
+        try:
+            path.with_name(QUOTA_FILE).unlink()
+        except FileNotFoundError:
+            pass
+    temporary = path.with_name(f'.{path.name}.tmp')
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'w', encoding='utf-8') as output:
+        json.dump({'lark': bool(on)}, output)
+        output.write('\n')
+    os.replace(temporary, path)
+    return path
 
 
 def _observed_at(snapshot):
@@ -90,8 +192,16 @@ class CardPublisher:
         max_days=32,
         client_factory=FeishuClient,
         uuid_namespace='yslzm-daily-board',
+        switch_path=None,
     ):
         self.private = Path(private).expanduser()
+        # None: no console-wide switch (cards always go to Lark).
+        self.switch_path = Path(switch_path).expanduser() if switch_path else None
+        # The shared quota pause sits next to the switch; without a switch it lives in memory.
+        self.quota_path = self.switch_path.with_name(QUOTA_FILE) if self.switch_path else None
+        self._quota_until = 0.0
+        self._quota_memory = False
+        self._board_store = None
         self.render = render
         self.sanitize = sanitize
         self.config_path = (
@@ -116,6 +226,8 @@ class CardPublisher:
         self._busy = False
         self._stopping = False
         self._backend = None  # (config signature, store, client, chat_id)
+        self._icons = None  # uploaded card images for the current bot
+        self._icons_retry_at = 0.0
         self._status = {'status': 'initializing', 'error_code': None, 'api_code': None}
         self._thread = threading.Thread(target=self._work, name='autocontrol-card', daemon=True)
         self._thread.start()
@@ -257,12 +369,55 @@ class CardPublisher:
                         self._retry_at = time.monotonic() + min(backoff, self.max_retry_interval)
                     self._cond.notify_all()
 
-    def _config_signature(self):
+    @staticmethod
+    def _file_signature(path):
+        if path is None:
+            return None
         try:
-            info = self.config_path.stat()
+            info = path.stat()
             return info.st_mtime_ns, info.st_size, info.st_ino
         except OSError:
             return None
+
+    def _config_signature(self):
+        config = self._file_signature(self.config_path)
+        paused = self._paused_until() is not None
+        if self.switch_path is None:
+            return config, paused
+        return (
+            config,
+            self._file_signature(self.switch_path),
+            self._file_signature(self.quota_path),
+            paused,
+        )
+
+    def _paused_until(self, now=None) -> float | None:
+        """Until when cards wait for next month's quota (None: not paused).
+
+        The shared file decides, so ``cards on`` (which deletes it) lifts the
+        pause in every scheduler; memory is used only when it cannot be written.
+        """
+        now = time.time() if now is None else now
+        if self.quota_path is not None and not self._quota_memory:
+            until = _read_pause(self.quota_path) or 0.0
+        else:
+            until = self._quota_until
+        return until if until > now else None
+
+    def _pause_for_quota(self) -> None:
+        self._quota_until = next_month()
+        self._quota_memory = self.quota_path is None
+        if self.quota_path is not None:
+            try:
+                _write_pause(self.quota_path, self._quota_until)
+            except OSError:
+                self._quota_memory = True  # this project still pauses
+
+    def _switched_off(self) -> bool:
+        return self.switch_path is not None and _switch_off(self.switch_path)
+
+    def _local_only(self) -> bool:
+        return self._switched_off() or self._paused_until() is not None
 
     def _ensure_backend(self):
         signature = self._config_signature()
@@ -270,12 +425,27 @@ class CardPublisher:
         if backend is not None and backend[0] == signature:
             return backend[1:]
         self._backend = None
+        if self._local_only():
+            # Cards are off: keep each snapshot for the web board under the
+            # usual chat key (so turning cards back on finds the same card).
+            try:
+                chat_id = load_config(self.config_path).get('chat_id') or 'local'
+            except DeliveryError:
+                chat_id = 'local'
+            store = BoardStore(self.db_path, sanitize=self.sanitize)
+            self._backend = (signature, store, None, chat_id)
+            if backend is not None:
+                with self._cond:
+                    for key, value in self._latest.items():
+                        self._pending.setdefault(key, value)
+            return self._backend[1:]
         config = load_config(self.config_path)
         if not config.get('chat_id'):
             raise DeliveryError('chat_id_missing')
         store = BoardStore(self.db_path, sanitize=self.sanitize)
         client = self.client_factory(config)
         self._backend = (signature, store, client, config['chat_id'])
+        self._icons = None  # a new bot needs its own uploads
         if backend is not None:
             # A new chat or app: bring every remembered day to the new target.
             with self._cond:
@@ -287,7 +457,13 @@ class CardPublisher:
         try:
             store, client, chat_id = self._ensure_backend()
         except DeliveryError as exc:
-            self._set_status('failed', exc.code, exc.api_code)
+            # No usable bot: the board still gets the display. Keep retrying,
+            # so a config written later sends the newest display to its card.
+            self._save_for_board(snapshot)
+            if exc.code in NO_BOT:
+                self._set_status('local', exc.code)
+            else:
+                self._set_status('failed', exc.code, exc.api_code)
             return False
         except Exception:
             self._set_status('failed', 'storage_error')
@@ -299,10 +475,52 @@ class CardPublisher:
             self._set_status('failed', 'storage_error')
             return False
 
-    def _publish(self, store, client, chat_id, snapshot) -> bool:
-        project, day = snapshot['project'], snapshot['service_day']
+    def _card_icons(self, client) -> dict:
+        """Uploaded images for the card; an upload failure falls back to static icons."""
+        now = time.monotonic()
+        if self._icons is not None and (self._icons or now < self._icons_retry_at):
+            return self._icons
         try:
-            card = self.render(snapshot)
+            self._icons = {'spinner': assets.spinner_key(self.private, client)}
+        except Exception:
+            self._icons, self._icons_retry_at = {}, now + 3600.0
+        return self._icons
+
+    def _save_for_board(self, snapshot) -> None:
+        """Save the display without any bot (no config, or a broken one)."""
+        try:
+            if self._board_store is None:
+                self._board_store = BoardStore(self.db_path, sanitize=self.sanitize)
+            store = self._board_store
+            project, day = snapshot['project'], snapshot['service_day']
+            row = store.get(project, day, 'local') or {}
+            if not is_older(snapshot, row.get('snapshot')):
+                store.save(project, day, 'local', snapshot=snapshot, delivery_status='local')
+        except Exception:
+            pass  # the card path reports its own status
+
+    def _keep_local(self, store, chat_id, snapshot) -> bool:
+        """Cards are off or paused: save the newest display for the web board, call nothing."""
+        paused = not self._switched_off() and self._paused_until() is not None
+        status, code = ('quota_paused', 'quota_exhausted') if paused else ('local', None)
+        project, day = snapshot['project'], snapshot['service_day']
+        row = store.get(project, day, chat_id) or {}
+        if is_older(snapshot, row.get('snapshot')):
+            self._set_status('stale_ignored')
+            return True
+        store.save(
+            project, day, chat_id, snapshot=snapshot, delivery_status=status, error_code=code
+        )
+        self._set_status(status, code)
+        return True
+
+    def _publish(self, store, client, chat_id, snapshot) -> bool:
+        if client is None:
+            return self._keep_local(store, chat_id, snapshot)
+        project, day = snapshot['project'], snapshot['service_day']
+        icons = self._card_icons(client)
+        try:
+            card = self.render(snapshot, icons=icons) if icons else self.render(snapshot)
             canonical = json.dumps(card, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
             digest = hashlib.sha256(canonical.encode('utf-8')).hexdigest()
         except Exception:
@@ -380,8 +598,8 @@ class CardPublisher:
                 )
                 client.update_card(message_id, card)
             else:
-                if row.get('delivery_status') == 'failed':
-                    started = None
+                if row.get('delivery_status') in ('failed', 'quota_paused'):
+                    started = None  # refused outright: nothing was created
                 started = started or time.time()
                 # Commit the stable identity before the network call, so a crash
                 # can recover from history or replay this exact UUID.
@@ -423,6 +641,17 @@ class CardPublisher:
             self._set_status('sent')
             return True
         except DeliveryError as exc:
+            if exc.code == 'quota_exhausted':
+                # Nothing helps before the 1st: pause every project's cards until
+                # then and keep the display for the board. Not retried.
+                self._pause_for_quota()
+                try:
+                    store.save(project, day, chat_id, snapshot=snapshot,
+                               delivery_status='quota_paused', error_code=exc.code)  # fmt: skip
+                except Exception:
+                    pass
+                self._set_status('quota_paused', exc.code, exc.api_code)
+                return True
             uncertain = exc.uncertain or (not message_id and recovering)
             try:
                 state = (

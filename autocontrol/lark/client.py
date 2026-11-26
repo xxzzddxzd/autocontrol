@@ -6,9 +6,11 @@ bodies, tokens and server messages are never logged, saved or raised.
 
 from __future__ import annotations
 
+import hashlib
 import http.client
 import json
 import os
+import secrets
 from pathlib import Path
 import stat
 import threading
@@ -18,9 +20,20 @@ from urllib import error, parse, request
 API_BASES = frozenset({'https://open.feishu.cn', 'https://open.larksuite.com'})
 MAX_RESPONSE_BYTES = 1024 * 1024
 MAX_CARD_BYTES = 29 * 1024
+MAX_IMAGE_BYTES = 10 * 1024 * 1024
 TOKEN_ERRORS = frozenset({99991661, 99991663, 99991664, 99991668})
 PERMISSION_ERRORS = frozenset({99991672, 99991676, 99991679, 230027})
 RATE_LIMIT_ERRORS = frozenset({230020})
+# The tenant's monthly API quota is used up: nothing helps until the 1st.
+QUOTA_ERRORS = frozenset({99991403})
+
+
+def _api_code(raw) -> int | None:
+    try:
+        code = json.loads(raw).get('code')
+    except (ValueError, UnicodeDecodeError, AttributeError):
+        return None
+    return code if type(code) is int else None
 
 
 class DeliveryError(Exception):
@@ -82,7 +95,9 @@ def request_json(method, url, headers, body, timeout) -> dict:
     """One HTTPS JSON exchange; writes that time out are marked uncertain."""
     write = method in ('POST', 'PATCH')
     encoded = None
-    if body is not None:
+    if isinstance(body, bytes):
+        encoded = body  # an already encoded body (multipart upload)
+    elif body is not None:
         encoded = json.dumps(body, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
     req = request.Request(url, data=encoded, headers=headers, method=method)
     try:
@@ -94,7 +109,10 @@ def request_json(method, url, headers, body, timeout) -> dict:
         finally:
             exc.close()
         if exc.code == 429:
-            raise DeliveryError('rate_limited') from None
+            code = _api_code(raw)
+            if code in QUOTA_ERRORS:
+                raise DeliveryError('quota_exhausted', api_code=code) from None
+            raise DeliveryError('rate_limited', api_code=code) from None
         if exc.code >= 500:
             raise DeliveryError('server_error', uncertain=write) from None
         try:
@@ -149,9 +167,14 @@ class FeishuClient:
     def chat_id(self):
         return self._config['chat_id']
 
-    def _request(self, method, path, body=None, *, token=None) -> dict:
+    @property
+    def app_fingerprint(self) -> str:
+        """A short digest naming the bot (the app id itself is never stored)."""
+        return hashlib.sha256(self._config['app_id'].encode('utf-8')).hexdigest()[:16]
+
+    def _request(self, method, path, body=None, *, token=None, content_type=None) -> dict:
         write = method in ('POST', 'PATCH')
-        headers = {'Content-Type': 'application/json; charset=utf-8'}
+        headers = {'Content-Type': content_type or 'application/json; charset=utf-8'}
         if token:
             headers['Authorization'] = 'Bearer ' + token
         try:
@@ -172,6 +195,8 @@ class FeishuClient:
                 category = 'permission_denied'
             elif code in RATE_LIMIT_ERRORS:
                 category = 'rate_limited'
+            elif code in QUOTA_ERRORS:
+                category = 'quota_exhausted'
             else:
                 category = 'api_error'
             raise DeliveryError(category, api_code=code)
@@ -198,11 +223,11 @@ class FeishuClient:
             self._token, self._token_expires = token, now + max(1, expire - 60)
             return self._token
 
-    def _api(self, method, path, body=None) -> dict:
+    def _api(self, method, path, body=None, *, content_type=None) -> dict:
         for attempt in range(2):
             token = self._get_token()
             try:
-                return self._request(method, path, body, token=token)
+                return self._request(method, path, body, token=token, content_type=content_type)
             except DeliveryError as exc:
                 if exc.code != 'token_invalid' or attempt:
                     raise
@@ -230,6 +255,28 @@ class FeishuClient:
             seen.add(page_token)
             if len(seen) > limit:
                 raise DeliveryError('pagination_limit')
+
+    def upload_image(self, data: bytes, filename: str, content_type: str) -> str:
+        """Upload a message image; return its ``image_key`` (usable in cards)."""
+        if not isinstance(data, bytes) or not data or len(data) > MAX_IMAGE_BYTES:
+            raise DeliveryError('invalid_image')
+        boundary = secrets.token_hex(16)
+        body = b''.join([
+            f'--{boundary}\r\nContent-Disposition: form-data; name="image_type"\r\n\r\n'
+            'message\r\n'.encode(),
+            f'--{boundary}\r\nContent-Disposition: form-data; name="image"; '
+            f'filename="{filename}"\r\nContent-Type: {content_type}\r\n\r\n'.encode(),
+            data,
+            f'\r\n--{boundary}--\r\n'.encode(),
+        ])  # fmt: skip
+        result = self._api(
+            'POST', '/im/v1/images', body, content_type=f'multipart/form-data; boundary={boundary}'
+        )
+        data_ = result.get('data')
+        key = data_.get('image_key') if isinstance(data_, dict) else None
+        if not isinstance(key, str) or not key.startswith('img_') or len(key) > 128:
+            raise DeliveryError('invalid_response')
+        return key
 
     def list_chats(self) -> list[dict]:
         """Chats the bot belongs to: only ``chat_id`` and a bounded ``name``."""

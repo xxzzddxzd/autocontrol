@@ -167,6 +167,35 @@ def manifest_schema() -> dict:
                     'timezone': {'type': 'string'},
                     'reset': clock,
                     'times': {'type': 'array', 'minItems': 1, 'items': clock},
+                    'phases': {
+                        'type': 'object',
+                        'additionalProperties': {
+                            'type': 'object',
+                            'additionalProperties': False,
+                            'required': ['times'],
+                            'properties': {
+                                'times': {'type': 'array', 'minItems': 1, 'items': clock},
+                                'wake': {'type': 'boolean'},
+                                'until': {'type': 'array', 'minItems': 1, 'items': clock},
+                                'idle': {
+                                    'type': 'object',
+                                    'additionalProperties': False,
+                                    'required': ['reason', 'times'],
+                                    'properties': {
+                                        'reason': {
+                                            'type': 'string',
+                                            'pattern': '^[a-z][a-z0-9_]{0,47}$',
+                                        },
+                                        'times': {'type': 'array', 'minItems': 1, 'items': clock},
+                                    },
+                                    'description': (
+                                        '低频时刻：该阶段同名分组里有任务最近一次报 blocked 且原因是 reason 时，'
+                                        '只在这些时刻运行；之后不再报这个原因就回到 times'
+                                    ),
+                                },
+                            },
+                        },
+                    },
                 },
             },
             'account_lock': {'type': ['string', 'null']},
@@ -199,7 +228,10 @@ def manifest_schema() -> dict:
                         'seed': {'type': 'boolean'},
                         'demand': {
                             'enum': list(DEMANDS),
-                            'description': '需求方：daily 每日、weekly 每周、window 服务器当天开放才有',
+                            'description': (
+                                '需求方：daily 每日、weekly 每周、window 服务器当天开放才有、'
+                                'round 每轮收菜（本轮执行报完成即算本轮完成，下一轮继续）'
+                            ),
                         },
                         'endpoint': {
                             'enum': list(ENDPOINTS),
@@ -208,6 +240,33 @@ def manifest_schema() -> dict:
                         'discovery': {
                             'type': 'boolean',
                             'description': '「开放活动」发现任务：上报当天开放但无模块处理的活动数',
+                        },
+                        'phase': {
+                            'type': 'string',
+                            'pattern': '^[a-z][a-z0-9_]{0,31}$',
+                            'description': (
+                                '执行这个任务的阶段（phases 之一），和所在分组不是同一个阶段时填写，'
+                                '比如列在日常分组、实际由有自己时刻表的阶段执行；卡片据此算下次执行时间'
+                            ),
+                        },
+                        'progress_text': {
+                            'type': 'string',
+                            'maxLength': 224,
+                            'pattern': '^(?:[^{}<>*~`\\[\\]\\n]|\\{[a-z][a-z0-9_]{0,47}\\})+$',
+                            'description': (
+                                '未完成行文字，规则同 done_text：代替进度数字和原因短标签显示；'
+                                '执行中、失败、结果未返回等状态照常显示；引用的计数缺一个就回到原来的显示'
+                            ),
+                        },
+                        'done_text': {
+                            'type': 'string',
+                            'maxLength': 224,
+                            'pattern': '^(?:[^{}<>*~`\\[\\]\\n]|\\{[a-z][a-z0-9_]{0,47}\\})+$',
+                            'description': (
+                                '完成行文字，接在完成时间后面：用 {计数名} 引用 count_keys 里的计数'
+                                '（1-4 个），其余文字不超过 24 个字符；引用的计数都报了非负整数才显示，'
+                                '如 "推进 {cleared} 关 · 当前 {chapter}-{stage}"'
+                            ),
                         },
                     },
                 },

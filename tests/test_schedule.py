@@ -94,3 +94,46 @@ def test_a_day_that_resets_late_is_named_by_the_date_it_mostly_falls_on():
     # An early reset keeps naming the day by the date it starts on.
     assert SCHEDULE.service_day(at(18, 4, 59)) == '2026-11-17'
     assert SCHEDULE.on_day('2026-11-17', '01:15') == at(18, 1, 15)
+
+
+def test_a_slot_with_a_deadline_is_never_caught_up_after_it():
+    boat = (('boat', ('18:45',)),)
+    schedule = Schedule(
+        times=('09:00',), reset='23:00', slots=boat, slot_until=(('boat', ('18:57',)),)
+    )
+
+    def at(text):
+        return datetime.fromisoformat(f'2026-11-18T{text}:00+08:00')
+
+    day = schedule.service_day(at('18:50'))
+    assert schedule.slot_deadline('boat', day, 0) == at('18:57')
+    assert schedule.slot_due('boat', at('18:50'))  # still inside its window: retried
+    assert not schedule.slot_due('boat', at('18:50'), {0})  # already ran
+    assert not schedule.slot_due('boat', at('19:31'))  # missed: never caught up
+    open_ended = Schedule(times=('09:00',), reset='23:00', slots=boat)
+    assert open_ended.slot_due('boat', at('19:31'))  # without a deadline: caught up later
+    with pytest.raises(ValueError):
+        Schedule(times=('09:00',), slots=boat, slot_until=(('boat', ('18:57', '19:00')),))
+    with pytest.raises(ValueError):
+        Schedule(times=('09:00',), slots=boat, slot_until=(('boat', ('18:45',)),))
+
+
+def test_idle_times_replace_a_phases_slots_while_its_work_is_out():
+    schedule = Schedule(
+        times=('12:00',),
+        slots=(('ship', ('06:00', '08:00', '10:00')),),
+        slot_until=(('ship', ('06:30', '08:30', '10:30')),),
+        idle=(('ship', 'insufficient_materials', ('06:00',)),),
+    )
+    assert schedule.idle_reasons == {'ship': 'insufficient_materials'}
+    assert schedule.with_idle(frozenset()) is schedule
+    idle = schedule.with_idle({'ship'})
+    assert idle.slot_map == {'ship': ('06:00',)} and idle.slot_until == ()
+    for bad in (
+        (('ghost', 'x', ('06:00',)),),
+        (('ship', 'x', ()),),
+        (('ship', '', ('06:00',)),),
+        (('ship', 'x', ('06:00',)), ('ship', 'y', ('07:00',))),
+    ):
+        with pytest.raises(ValueError):
+            Schedule(times=('12:00',), slots=(('ship', ('06:00',)),), idle=bad)

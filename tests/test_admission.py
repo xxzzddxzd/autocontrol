@@ -109,3 +109,23 @@ def test_window_tasks_without_a_discovery_task_are_flagged(tmp_path):
 def test_projects_without_window_tasks_pass_the_window_checks(tmp_path):
     report = run_check(demo_copy(tmp_path), save=False)
     assert criteria(report)['M8'] and criteria(report)['S5']
+
+
+def test_the_declared_account_lock_must_be_probeable(tmp_path):
+    held = tmp_path / 'reports'
+    held.mkdir()
+    (held / 'main-account.lock').touch(mode=0o644)
+    ok = criteria(run_check(demo_copy(tmp_path / 'a', account_lock=str(held / 'main-account.lock')),
+                            live=False))  # fmt: skip
+    assert ok['M9']
+    bad = criteria(run_check(demo_copy(tmp_path / 'b', account_lock=str(held)), live=False))
+    assert not bad['M9']
+
+
+def test_the_first_check_creates_a_private_directory_serve_accepts(tmp_path):
+    import stat
+
+    manifest = demo_copy(tmp_path)
+    report = run_check(manifest)
+    private = tmp_path / 'private'
+    assert report['saved_to'] and stat.S_IMODE(private.stat().st_mode) == 0o700

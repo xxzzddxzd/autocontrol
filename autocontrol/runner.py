@@ -14,6 +14,7 @@ import time
 import uuid
 
 from . import locks, protocol
+from .schedule import SAME_TIME
 
 
 def _valid_day(value) -> bool:
@@ -63,6 +64,9 @@ class RoundRunner:
         self.projection = project.new_projection(now)
         self._views = {self.projection.day: self.projection}
         self.dynamic_candidates: tuple[float, ...] = ()
+        self.dynamic_owners: dict[float, frozenset[str]] = {}
+        # Times the last round's phases reported that passed during it (take_overdue).
+        self.overdue: tuple[float, ...] = ()
         self._events = 0
         self.round_id = None
 
@@ -95,6 +99,7 @@ class RoundRunner:
         if day not in self._views:
             self._views[day] = self.project.new_projection(self.project.schedule.day_anchor(day))
             self._views[day].set_round(getattr(self, '_round', ()))
+            self._views[day].set_manual(getattr(self, '_manual', False))
         view = self._views[day]
         if day >= self.projection.day:
             self.projection = view
@@ -126,7 +131,7 @@ class RoundRunner:
             for row in view.snapshot()['tasks']
             if row['level'] != 'step'
             and row['availability'] != 'closed'
-            and (section is None or row['phase'] == section)
+            and (section is None or project.catalog.run_section(row['task_id']) == section)
         ]
         count = lambda *states: sum(row['status'] in states for row in rows)  # noqa: E731
         stage, error = _code(record.get('failure_stage')), record.get('error_type')
@@ -178,34 +183,62 @@ class RoundRunner:
         the window of its latest slot still lacks a successful run.
         """
         project = self.project
-        schedule = project.schedule
-        now = schedule.local(now) or schedule.now()
+        now = project.schedule.local(now) or project.schedule.now()
+        view = self._slot_view(now)
+        schedule = view.effective_schedule  # a phase whose work is out keeps its idle times
         slots = schedule.slot_map
         fixed = scheduled_at is None or schedule.is_fixed(scheduled_at)
         dynamic = scheduled_at is not None and schedule.is_dynamic(
             scheduled_at, self.dynamic_candidates
         )
-        done = self._slot_runs(now)
+        done = view.slot_runs
+        owners = self._owners(scheduled_at) if dynamic else None
+        wake = set(schedule.wake_phases)
+        # A server time that only wake phases reported runs only them.
+        exclusive = owners is not None and owners <= wake
         selected = []
         for phase in project.phases:
             if phase not in slots:
-                woken = dynamic and (
-                    schedule.dynamic_phases is None or phase in schedule.dynamic_phases
+                woken = (
+                    dynamic
+                    and not exclusive
+                    and (schedule.dynamic_phases is None or phase in schedule.dynamic_phases)
                 )
                 if fixed or woken:
                     selected.append(phase)
                 continue
-            window = schedule.slot_window(phase, now)
-            behind = window is not None and window not in done.get(phase, frozenset())
-            if (scheduled_at is not None and schedule.is_slot(phase, scheduled_at)) or behind:
+            behind = schedule.slot_due(phase, now, done.get(phase, frozenset()))
+            reported = owners is not None and phase in owners and phase in wake
+            if (
+                (scheduled_at is not None and schedule.is_slot(phase, scheduled_at))
+                or behind
+                or reported
+            ):
                 selected.append(phase)
         return tuple(selected)
 
-    def _slot_runs(self, now) -> dict:
-        """Slot windows of the current service day that already had a successful run."""
+    def _owners(self, when) -> frozenset[str] | None:
+        """Who reported the server time ``when``; ``None`` when nobody is known."""
+        stamp = self.project.schedule.local(when)
+        found, unknown = set(), False
+        for candidate in self.dynamic_candidates:
+            if stamp is not None and abs(candidate - stamp.timestamp()) < SAME_TIME.total_seconds():
+                owners = self.dynamic_owners.get(candidate)
+                if owners:
+                    found |= owners
+                else:
+                    unknown = True
+        return None if unknown or not found else frozenset(found)
+
+    def _slot_view(self, now):
+        """The current service day as saved, with today's successful slot runs."""
         view = self.project.new_projection(now)
         self._backfill_slots(view)
-        return view.slot_runs
+        return view
+
+    def effective_schedule(self, now=None):
+        """The schedule the next wake follows (idle times while a phase's work is out)."""
+        return self._slot_view(now).effective_schedule
 
     def _backfill_slots(self, view) -> None:
         slots = self.project.schedule.slot_map
@@ -218,10 +251,84 @@ class RoundRunner:
         for phase, started in starts:
             view.mark_slot(phase, started)
 
-    def run_once(self, *, observe_only=False, phase=None, now=None, phases=None) -> dict:
+    def missed_slots(self, since, now=None) -> tuple[str, ...]:
+        """Slotted phases whose slot time passed while the last round ran, still unrun.
+
+        The service runs them right after the round (see service._missed),
+        instead of leaving them to the next wake, which may be hours away.
+        """
+        schedule = self.project.schedule
+        now = schedule.local(now) or schedule.now()
+        since = schedule.local(since)
+        if since is None or not schedule.slot_map:
+            return ()
+        view = self._slot_view(now)
+        plan = view.effective_schedule
+        done = view.slot_runs
+        day = plan.service_day(now)
+        missed = {
+            phase
+            for phase in plan.slot_map
+            if any(since + SAME_TIME < stamp <= now for stamp in plan.slot_stamps(phase, day))
+            and plan.slot_due(phase, now, done.get(phase, frozenset()))
+        }
+        return tuple(phase for phase in self.project.phases if phase in missed)
+
+    def take_overdue(self) -> tuple[float, ...]:
+        """Times the last round's phases reported that passed during it, once.
+
+        The service runs the earliest right after the round (see service._late).
+        """
+        found, self.overdue = self.overdue, ()
+        return found
+
+    def resume(self, now=None) -> bool:
+        """Take up the saved day after a restart that needs no login (new console code).
+
+        The wakes earlier rounds reported come back from the saved card, which
+        is drawn again with the current code. Nothing runs and nobody logs in.
+        """
+        return self._draw(now)
+
+    def start_day(self, now=None) -> bool:
+        """The new service day's card from the manifest alone, without a login.
+
+        For a reset that a round follows soon: that round reads the server.
+        """
+        return self._draw(now)
+
+    def _draw(self, now) -> bool:
+        """Load the saved day and publish it; False when a round holds the project."""
+        project = self.project
+        now = project.schedule.local(now) or project.schedule.now()
+        view = project.new_projection(now)
+        self._backfill_slots(view)
+        # Shown as planned rather than 读取中; nothing is read or claimed.
+        view.apply_event({'kind': 'plan', 'plan': {'full_checklist_summary': {'goals': {}}}})
+        self.projection = view
+        self._views = {view.day: view}
+        self.dynamic_candidates = tuple(view.dynamic_candidates)
+        self.dynamic_owners = dict(view.dynamic_owners)
+        self.overdue = ()
+        try:
+            fd = locks.acquire(project.round_lock)
+        except locks.AlreadyRunning:
+            return False  # a round is running and draws the card itself
+        try:
+            self._publish(view)
+        finally:
+            os.close(fd)
+        self._flush()
+        return True
+
+    def run_once(
+        self, *, observe_only=False, phase=None, now=None, phases=None, manual=False
+    ) -> dict:
+        """Run one round; ``manual`` marks a round started by hand (``once``)."""
         project = self.project
         now = now or project.schedule.now()
         started = datetime.now(project.schedule.tz)
+        self._manual = bool(manual)
         fd = locks.acquire(project.round_lock)
         try:
             result = self._run_locked(
@@ -259,6 +366,7 @@ class RoundRunner:
         # Same-day history may decorate the display. It never changes the phase
         # list, authorization, quotas or the server reads below.
         self.projection = project.new_projection(now)
+        self.projection.set_manual(getattr(self, '_manual', False))
         self._backfill_slots(self.projection)
         if phase:
             phases = (phase,)
@@ -268,6 +376,8 @@ class RoundRunner:
         self.projection.set_round(self._round)
         self._views = {self.projection.day: self.projection}
         self.dynamic_candidates = ()
+        self.dynamic_owners = {}
+        self.overdue = ()
         target_day = self.projection.day
         self.projection.apply_event(
             {'kind': 'plan', 'plan': {'full_checklist_summary': {'goals': {}}}}
@@ -292,6 +402,13 @@ class RoundRunner:
                 self._publish(view)
                 self._record_task_days(view)
         self.dynamic_candidates = tuple(self.projection.dynamic_candidates)
+        self.dynamic_owners = dict(self.projection.dynamic_owners)
+        late = {} if observe_only else self.projection.overdue_wakes()
+        if late:
+            # Kept among the candidates so phases_for knows who owns them.
+            self.overdue = tuple(sorted(late))
+            self.dynamic_candidates = tuple(sorted({*self.dynamic_candidates, *late}))
+            self.dynamic_owners.update({stamp: found for stamp, found in late.items() if found})
         return {
             'status': status,
             'code': code,
@@ -303,10 +420,20 @@ class RoundRunner:
 
     def _record_task_days(self, view) -> None:
         snapshot = view.snapshot()
-        statuses = {
-            row['task_id']: row['status'] for row in snapshot['tasks'] if row['level'] != 'step'
+        try:  # the card's own count of the day; metrics never affect a round
+            verdicts = self.project.task_verdicts(snapshot)
+        except Exception:
+            verdicts = None
+        rows = {
+            row['task_id']: {
+                'status': row['status'],
+                'done': None if verdicts is None else verdicts.get(row['task_id'], -1),
+                'fail_streak': row.get('fail_streak'),
+            }
+            for row in snapshot['tasks']
+            if row['level'] != 'step'
         }
-        self._record('record_task_days', self.project.name, view.day, statuses,
+        self._record('record_task_days', self.project.name, view.day, rows,
                      snapshot.get('observed_at') or datetime.now().isoformat(timespec='seconds'))  # fmt: skip
 
     def _observe(self, day) -> tuple[int, str]:
@@ -317,6 +444,10 @@ class RoundRunner:
                                            round_id=self.round_id)  # fmt: skip
         except (OSError, subprocess.TimeoutExpired):
             code, record = 1, {'execution': 'failed', 'failure_stage': 'connect'}
+        # Discovery is read-only: an unknown it reports is never evidence that
+        # a state observed earlier today was undone.
+        for view in self._views.values():
+            view.keep_known()
         self._record(
             'record_phase',
             self._phase_row(project.status_phase, record, 'observe', self._events, self.projection),
@@ -400,6 +531,13 @@ class RoundRunner:
             state['count'] -= 1
         return tuple(pending)
 
+    def _sent_nothing(self, record) -> bool:
+        """The phase's own metrics show it sent no request, so it changed nothing."""
+        try:
+            return self.project.phase_metrics(record).get('actions_sent') == 0
+        except Exception:
+            return False
+
     def _start_phase(self, name, state) -> None:
         self._event({'kind': 'phase_started', 'phase': name})
         self._events = 0
@@ -409,6 +547,8 @@ class RoundRunner:
         project = self.project
         view = self._view(record.get('game_day'))
         view.apply_result(project.result_facts(record))
+        if self._sent_nothing(record):
+            view.keep_known()
         self._publish(view)
         self._record('record_phase', self._phase_row(name, record, 'execute', self._events, view))
         try:
@@ -424,6 +564,9 @@ class RoundRunner:
             # A successful run covers the slot window it started in.
             view.mark_slot(name, record.get('started_at') or project.schedule.now())
             self._publish(view)  # fmt: skip
+        elif code and name in project.schedule.slot_map and not project.is_busy(record):
+            view.mark_slot(name, record.get('started_at') or project.schedule.now(), failed=True)
+            self._publish(view)
         if project.is_busy(record):
             # Yield to a manual command instead of competing for the account.
             state['busy'] = True

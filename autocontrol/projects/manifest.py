@@ -18,7 +18,7 @@ import uuid
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .. import protocol, storage
-from ..board.catalog import DEMANDS, ENDPOINTS, Catalog, Section, TaskSpec
+from ..board.catalog import DEMANDS, DONE_FIELD, ENDPOINTS, Catalog, Section, TaskSpec
 from ..schedule import Schedule, _clock
 from ..worker import last_json_line, run_streamed
 from .base import Project
@@ -32,8 +32,12 @@ MANIFEST_KEYS = frozenset(
     count_keys units'''.split()
 )
 TASK_KEYS = frozenset(
-    ('id', 'title', 'section', 'kind', 'parent', 'seed', 'demand', 'endpoint', 'discovery')
-)
+    ('id', 'title', 'section', 'kind', 'parent', 'seed', 'demand', 'endpoint', 'discovery',
+     'done_text', 'progress_text', 'phase')
+)  # fmt: skip
+# A finished row's text: a few words around its {count_key} fields.
+DONE_WORDS = 24
+DONE_FIELDS = 4
 PHASE_STATES = {
     'complete': ('complete', 'skipped'),
     'incomplete': ('partial',),
@@ -58,6 +62,26 @@ def _text(value, limit) -> bool:
         and 1 <= len(value) <= limit
         and not any(ch in value for ch in '<>*~`[]\n')
     )
+
+
+def _text_template_problems(ident, field, template, declared) -> list[str]:
+    if type(template) is not str:
+        return [f'task {ident} {field} must be a string']
+    names = DONE_FIELD.findall(template)
+    words = DONE_FIELD.sub('', template)
+    if (
+        not 1 <= len(names) <= DONE_FIELDS
+        or len(words) > DONE_WORDS
+        or any(ch in words for ch in '{}<>*~`[]\n')
+    ):
+        return [
+            f'task {ident} {field} must be up to {DONE_WORDS} characters'
+            f' around 1-{DONE_FIELDS} {{count_key}} fields'
+        ]
+    unknown = sorted(set(names) - declared)
+    if unknown:
+        return [f'task {ident} {field} uses undeclared count_keys: {", ".join(unknown)}']
+    return []
 
 
 def validate_manifest(data) -> list[str]:
@@ -115,8 +139,8 @@ def validate_manifest(data) -> list[str]:
     ):
         problems.append('timeouts must map phase/observe to 10-86400 seconds')
     schedule = data.get('schedule')
-    if type(schedule) is not dict or set(schedule) - {'timezone', 'reset', 'times'}:
-        problems.append('schedule must have timezone, reset and times')
+    if type(schedule) is not dict or set(schedule) - {'timezone', 'reset', 'times', 'phases'}:
+        problems.append('schedule must have timezone, reset and times (and optional phases)')
     else:
         try:
             ZoneInfo(schedule.get('timezone', 'Asia/Shanghai'))
@@ -130,6 +154,7 @@ def validate_manifest(data) -> list[str]:
                 _clock(value)
         except (ValueError, TypeError, AttributeError):
             problems.append('schedule.times must be a non-empty list of HH:MM (and reset HH:MM)')
+        problems.extend(_phase_schedule_problems(schedule.get('phases', {}), phases))
     if type(data.get('run_scope', False)) is not bool:
         problems.append('run_scope must be true or false')
     sections = data.get('sections')
@@ -155,6 +180,8 @@ def validate_manifest(data) -> list[str]:
         problems.append('phase_titles must map phases to 1-16 character titles')
     tasks = data.get('tasks')
     ids = {}
+    declared = data.get('count_keys', [])
+    declared = {k for k in declared if type(k) is str} if type(declared) is list else set()
     if type(tasks) is not list or not tasks or len(tasks) > protocol.MAX_TASKS:
         problems.append(f'tasks must be a list of 1-{protocol.MAX_TASKS} tasks')
     else:
@@ -162,7 +189,7 @@ def validate_manifest(data) -> list[str]:
             if type(item) is not dict or set(item) - TASK_KEYS:
                 problems.append(
                     'each task needs id and title (and optional section, kind, parent, seed,'
-                    ' demand, endpoint, discovery)'
+                    ' demand, endpoint, discovery, done_text, progress_text, phase)'
                 )
                 continue
             ident = item.get('id')
@@ -193,6 +220,13 @@ def validate_manifest(data) -> list[str]:
                 problems.append(f'task {ident} discovery must be true or false')
             elif item.get('discovery') and kind == 'step':
                 problems.append(f'discovery task {ident} must be a goal or job')
+            if 'phase' in item and (
+                kind == 'step' or type(phases) is not list or item['phase'] not in phases
+            ):
+                problems.append(f'task {ident} phase must be one of phases (not for a step)')
+            for field in ('done_text', 'progress_text'):
+                if field in item:
+                    problems += _text_template_problems(ident, field, item[field], declared)
         if sum(type(item) is dict and item.get('discovery') is True for item in tasks) > 1:
             problems.append('at most one task may be the discovery task')
     reasons = data.get('reasons', {})
@@ -205,6 +239,12 @@ def validate_manifest(data) -> list[str]:
         problems.append('short_reasons must map reason codes to 1-8 character labels')
     elif type(reasons) is dict and set(short) - set(reasons) - set(protocol.STANDARD_REASONS):
         problems.append('short_reasons may only use known reason codes')
+    own = data.get('schedule', {}).get('phases', {}) if type(data.get('schedule')) is dict else {}
+    known = set(protocol.STANDARD_REASONS) | (set(reasons) if type(reasons) is dict else set())
+    for name, item in own.items() if type(own) is dict else ():
+        idle = item.get('idle') if type(item) is dict else None
+        if type(idle) is dict and type(idle.get('reason')) is str and idle['reason'] not in known:
+            problems.append(f'schedule.phases.{name}.idle.reason must be a known reason code')
     counts = data.get('count_keys', [])
     if type(counts) is not list or not all(type(k) is str and REASON.fullmatch(k) for k in counts):
         problems.append('count_keys must be a list of [a-z][a-z0-9_]* names')
@@ -214,6 +254,76 @@ def validate_manifest(data) -> list[str]:
     return problems
 
 
+def _phase_schedule_problems(own, phases) -> list[str]:
+    """``schedule.phases``: phases that keep their own times instead of ``schedule.times``."""
+    if type(own) is not dict:
+        return ['schedule.phases must map phase names to {"times": [...]}']
+    problems = []
+    for name, item in own.items():
+        if name not in phases:
+            problems.append(f'schedule.phases.{name} is not a listed phase')
+            continue
+        texts = item.get('times') if type(item) is dict else None
+        try:
+            if (
+                set(item) - {'times', 'wake', 'until', 'idle'}
+                or type(texts) is not list
+                or not texts
+                or len(set(texts)) != len(texts)
+                or type(item.get('wake', True)) is not bool
+            ):
+                raise ValueError
+            for value in texts:
+                _clock(value)
+            deadlines = item.get('until')
+            if deadlines is not None:
+                if type(deadlines) is not list or len(deadlines) != len(texts):
+                    raise ValueError
+                for start, deadline in zip(texts, deadlines):
+                    if _clock(deadline) == _clock(start):
+                        raise ValueError
+            idle = item.get('idle')
+            if idle is not None:
+                quiet = idle.get('times') if type(idle) is dict else None
+                if (
+                    set(idle) != {'reason', 'times'}
+                    or type(idle['reason']) is not str
+                    or not REASON.fullmatch(idle['reason'])
+                    or type(quiet) is not list
+                    or not quiet
+                    or len(set(quiet)) != len(quiet)
+                ):
+                    raise ValueError
+                for value in quiet:
+                    _clock(value)
+        except (ValueError, TypeError, AttributeError):
+            problems.append(
+                f'schedule.phases.{name} must be {{"times": [distinct HH:MM], "wake": bool, '
+                '"until": [one HH:MM deadline per time], '
+                '"idle": {"reason": code, "times": [distinct HH:MM]}}'
+            )
+    if phases and own and set(phases) <= set(own):
+        problems.append('at least one phase must follow schedule.times')
+    return problems
+
+
+MAX_MANIFEST = 256 * 1024
+
+
+def digest_of(data) -> str:
+    """The content digest an admission record is bound to."""
+    return hashlib.sha256(json.dumps(data, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
+def manifest_digest(path) -> str | None:
+    """A manifest file's digest as it is now, without validating it; None if unreadable."""
+    try:
+        raw = Path(path).expanduser().read_bytes()
+        return digest_of(json.loads(raw)) if len(raw) <= MAX_MANIFEST else None
+    except (OSError, ValueError, UnicodeError):
+        return None
+
+
 def load_manifest(path) -> tuple[dict, str]:
     """Read and validate a manifest; return it with its content digest."""
     path = Path(path).expanduser()
@@ -221,7 +331,7 @@ def load_manifest(path) -> tuple[dict, str]:
         raw = path.read_bytes()
     except OSError as error:
         raise ManifestError([f'cannot read manifest: {type(error).__name__}']) from None
-    if len(raw) > 256 * 1024:
+    if len(raw) > MAX_MANIFEST:
         raise ManifestError(['manifest larger than 256 KiB'])
     try:
         data = json.loads(raw)
@@ -230,10 +340,7 @@ def load_manifest(path) -> tuple[dict, str]:
     problems = validate_manifest(data)
     if problems:
         raise ManifestError(problems)
-    digest = hashlib.sha256(
-        json.dumps(data, sort_keys=True, ensure_ascii=False).encode()
-    ).hexdigest()
-    return data, digest
+    return data, digest_of(data)
 
 
 def build_catalog(data) -> Catalog:
@@ -251,6 +358,9 @@ def build_catalog(data) -> Catalog:
             demand=item.get('demand'),
             endpoint=item.get('endpoint'),
             discovery=item.get('discovery', False),
+            done_text=item.get('done_text'),
+            progress_text=item.get('progress_text'),
+            phase=item.get('phase'),
         )
         for item in data['tasks']
     ]
@@ -277,17 +387,30 @@ def build_catalog(data) -> Catalog:
         units=(*protocol.STANDARD_UNITS, *data.get('units', ())),
         plan_kinds=('goal', 'job', 'step'),
         day_done_reasons=protocol.DAY_DONE_REASONS,
+        # 每轮收菜: done once this round's own execution reports it complete.
+        round_tasks={item['id']: () for item in data['tasks'] if item.get('demand') == 'round'},
     )
 
 
 def build_schedule(data) -> Schedule:
     config = data['schedule']
     name = config.get('timezone', 'Asia/Shanghai')
+    own = config.get('phases', {})
     return Schedule(
         times=tuple(config['times']),
         reset=config.get('reset', '05:00'),
         tz=ZoneInfo(name),
         tz_name=name,
+        slots=tuple((phase, tuple(item['times'])) for phase, item in own.items()),
+        slot_until=tuple(
+            (phase, tuple(item['until'])) for phase, item in own.items() if item.get('until')
+        ),
+        wake_phases=tuple(phase for phase, item in own.items() if item.get('wake', True)),
+        idle=tuple(
+            (phase, item['idle']['reason'], tuple(item['idle']['times']))
+            for phase, item in own.items()
+            if item.get('idle')
+        ),
     )
 
 
@@ -399,10 +522,12 @@ class ManifestProject(Project):
         try:
             if not self.workdir.is_dir():
                 raise FileNotFoundError(str(self.workdir))
+            label = phase if mode == 'execute' else f'{phase}-{mode}'
             child = run_streamed(
                 self.argv(phase, mode, day), cwd=self.workdir, on_event=handle,
                 progress_env=protocol.ENV_PROGRESS_FD, timeout=timeout,
                 input=payload if payload is not None else b'', env=env, raw=True,
+                on_stderr=lambda data: storage.keep_stderr(self.private, started, label, data),
             )  # fmt: skip
             code = child.returncode
             raw = last_json_line(child.stdout, protocol.MAX_RESULT_BYTES)
